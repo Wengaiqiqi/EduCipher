@@ -36,6 +36,7 @@ class TranscriptionConfig:
     mimo_api_key_env: str = "MIMO_API_KEY"
     mimo_language: str = "auto"
     mimo_max_concurrency: int = 3
+    mimo_max_chunk_duration_sec: float = 90.0
     mimo_timeout_sec: float = 180.0
     mimo_max_retries: int = 3
     ffmpeg_path: str | None = None
@@ -81,6 +82,7 @@ class TranscriptionConfig:
             model=self.mimo_model,
             language=self.mimo_language,
             max_concurrency=self.mimo_max_concurrency,
+            max_chunk_duration_sec=self.mimo_max_chunk_duration_sec,
             timeout_sec=self.mimo_timeout_sec,
             max_retries=self.mimo_max_retries,
             ffmpeg_path=self.ffmpeg_path,
@@ -353,6 +355,7 @@ def transcribe_video_pages(
             model=config.mimo_model,
             language=config.mimo_language,
             max_concurrency=config.mimo_max_concurrency,
+            max_chunk_duration_sec=config.mimo_max_chunk_duration_sec,
             timeout_sec=config.mimo_timeout_sec,
             max_retries=config.mimo_max_retries,
             ffmpeg_path=config.ffmpeg_path,

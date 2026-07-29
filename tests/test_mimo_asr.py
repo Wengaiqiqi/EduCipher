@@ -93,6 +93,55 @@ class MimoASRTests(unittest.TestCase):
             self.assertTrue(extracted_paths)
             self.assertTrue(all(not path.exists() for path in extracted_paths))
 
+    def test_long_page_is_split_and_merged_in_time_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"fake-video")
+            extracted_ranges: list[tuple[float, float]] = []
+
+            def extractor(
+                _: Path,
+                start_sec: float,
+                end_sec: float,
+                output: Path,
+            ) -> None:
+                extracted_ranges.append((start_sec, end_sec))
+                output.write_bytes(b"R" * 100)
+
+            transcripts, statistics = transcribe_pages_with_mimo(
+                video,
+                [{"page_id": 1, "start_sec": 5.0, "end_sec": 30.0}],
+                settings=MimoASRSettings(
+                    max_concurrency=1,
+                    max_chunk_duration_sec=10.0,
+                ),
+                api_key="test-key",
+                requester=lambda path: path.stem,
+                audio_extractor=extractor,
+            )
+
+            self.assertEqual(
+                extracted_ranges,
+                [(5.0, 15.0), (15.0, 25.0), (25.0, 30.0)],
+            )
+            self.assertEqual(
+                transcripts[0]["speech_text"],
+                "\n".join(
+                    [
+                        "page_0001_chunk_001",
+                        "page_0001_chunk_002",
+                        "page_0001_chunk_003",
+                    ]
+                ),
+            )
+            self.assertEqual(
+                transcripts[0]["cloud_audio_chunk_count"],
+                3,
+            )
+            self.assertEqual(statistics["page_request_count"], 1)
+            self.assertEqual(statistics["audio_chunk_request_count"], 3)
+
     def test_cloud_engine_writes_existing_transcript_structure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

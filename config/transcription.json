@@ -14,6 +14,7 @@
   "mimo_api_key_env": "MIMO_API_KEY",
   "mimo_language": "auto",
   "mimo_max_concurrency": 3,
+  "mimo_max_chunk_duration_sec": 90.0,
   "mimo_timeout_sec": 180.0,
   "mimo_max_retries": 3,
   "ffmpeg_path": null

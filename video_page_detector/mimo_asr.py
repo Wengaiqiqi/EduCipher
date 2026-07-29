@@ -20,6 +20,7 @@ class MimoASRSettings:
     model: str = "mimo-v2.5-asr"
     language: str = "auto"
     max_concurrency: int = 3
+    max_chunk_duration_sec: float = 90.0
     timeout_sec: float = 180.0
     max_retries: int = 3
     ffmpeg_path: str | None = None
@@ -33,6 +34,8 @@ class MimoASRSettings:
             raise ValueError("小米ASR语言设置不能为空。")
         if not 1 <= self.max_concurrency <= 10:
             raise ValueError("小米ASR并发数量必须在1到10之间。")
+        if self.max_chunk_duration_sec <= 0:
+            raise ValueError("小米ASR单段音频时长必须大于0。")
         if self.timeout_sec <= 0:
             raise ValueError("小米ASR超时时间必须大于0。")
         if self.max_retries < 1:
@@ -47,6 +50,14 @@ class MimoPageResult:
     text: str
     request_duration_sec: float
     audio_size_bytes: int
+    chunks: tuple["MimoChunkResult", ...]
+
+
+@dataclass(frozen=True)
+class MimoChunkResult:
+    start_sec: float
+    end_sec: float
+    text: str
 
 
 MimoProgressCallback = Callable[[str, int, int], None]
@@ -268,29 +279,64 @@ def transcribe_pages_with_mimo(
         page_id = int(page["page_id"])
         start_sec = float(page["start_sec"])
         end_sec = float(page["end_sec"])
-        audio_path = temp_root / f"page_{page_id:04d}.wav"
         request_started = time.perf_counter()
-        try:
-            actual_extractor(video, start_sec, end_sec, audio_path)
-            audio_size = audio_path.stat().st_size
-            text = _request_with_retries(
-                audio_path,
-                settings=settings,
-                requester=actual_requester,
-            ).strip()
-            return MimoPageResult(
-                page_id=page_id,
-                start_sec=start_sec,
-                end_sec=end_sec,
-                text=text,
-                request_duration_sec=time.perf_counter() - request_started,
-                audio_size_bytes=audio_size,
+        chunk_ranges: list[tuple[float, float]] = []
+        chunk_start = start_sec
+        while chunk_start < end_sec:
+            chunk_end = min(
+                end_sec,
+                chunk_start + settings.max_chunk_duration_sec,
             )
-        finally:
+            chunk_ranges.append((chunk_start, chunk_end))
+            chunk_start = chunk_end
+
+        chunks: list[MimoChunkResult] = []
+        audio_size = 0
+        for chunk_index, (chunk_start, chunk_end) in enumerate(
+            chunk_ranges,
+            start=1,
+        ):
+            if len(chunk_ranges) == 1:
+                filename = f"page_{page_id:04d}.wav"
+            else:
+                filename = (
+                    f"page_{page_id:04d}_chunk_{chunk_index:03d}.wav"
+                )
+            audio_path = temp_root / filename
             try:
-                audio_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                actual_extractor(
+                    video,
+                    chunk_start,
+                    chunk_end,
+                    audio_path,
+                )
+                audio_size += audio_path.stat().st_size
+                text = _request_with_retries(
+                    audio_path,
+                    settings=settings,
+                    requester=actual_requester,
+                ).strip()
+                chunks.append(
+                    MimoChunkResult(
+                        start_sec=chunk_start,
+                        end_sec=chunk_end,
+                        text=text,
+                    )
+                )
+            finally:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return MimoPageResult(
+            page_id=page_id,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            text="\n".join(chunk.text for chunk in chunks if chunk.text),
+            request_duration_sec=time.perf_counter() - request_started,
+            audio_size_bytes=audio_size,
+            chunks=tuple(chunks),
+        )
 
     results: dict[int, MimoPageResult] = {}
     with tempfile.TemporaryDirectory(prefix="classroom-ppt-mimo-asr-") as temp:
@@ -312,22 +358,22 @@ def transcribe_pages_with_mimo(
     page_transcripts: list[dict[str, Any]] = []
     request_durations: list[float] = []
     uploaded_bytes = 0
+    audio_chunk_request_count = 0
     for page in pages:
         page_id = int(page["page_id"])
         item = results[page_id]
         request_durations.append(item.request_duration_sec)
         uploaded_bytes += item.audio_size_bytes
-        utterances = (
-            [
-                {
-                    "start_sec": round(item.start_sec, 3),
-                    "end_sec": round(item.end_sec, 3),
-                    "text": item.text,
-                }
-            ]
-            if item.text
-            else []
-        )
+        audio_chunk_request_count += len(item.chunks)
+        utterances = [
+            {
+                "start_sec": round(chunk.start_sec, 3),
+                "end_sec": round(chunk.end_sec, 3),
+                "text": chunk.text,
+            }
+            for chunk in item.chunks
+            if chunk.text
+        ]
         page_transcripts.append(
             {
                 "page_id": page_id,
@@ -339,10 +385,13 @@ def transcribe_pages_with_mimo(
                 "cloud_request_duration_sec": round(
                     item.request_duration_sec, 3
                 ),
+                "cloud_audio_chunk_count": len(item.chunks),
             }
         )
     statistics = {
         "page_request_count": total,
+        "audio_chunk_request_count": audio_chunk_request_count,
+        "max_chunk_duration_sec": settings.max_chunk_duration_sec,
         "max_concurrency": min(settings.max_concurrency, total),
         "uploaded_audio_bytes": uploaded_bytes,
         "average_page_request_duration_sec": round(

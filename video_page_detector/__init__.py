@@ -4,4 +4,4 @@ from .config import DetectorConfig
 from .pipeline import VideoPageDetector
 
 __all__ = ["DetectorConfig", "VideoPageDetector"]
-__version__ = "1.0.0"
+__version__ = "1.1.1"
