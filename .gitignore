@@ -1,0 +1,49 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local application data and generated artifacts
+models/
+dist/
+build/
+diagnostics/
+output/
+tmp/
+test_vedio/
+comparison_*/
+场景阈值方法/legacy_output/
+
+# Large media files
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.m4v
+*.webm
+*.wav
+*.mp3
+
+# Secrets and machine-local settings
+.env
+.env.*
+*.key
+*.pem
+config/local*.json
+
+# Local agent/upload workspaces
+.agents/
+.github_upload/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

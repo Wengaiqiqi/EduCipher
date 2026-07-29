@@ -1,0 +1,11 @@
+{
+  "model": "small",
+  "language": "zh",
+  "device": "cpu",
+  "compute_type": "int8",
+  "beam_size": 1,
+  "vad_filter": true,
+  "model_download_root": "models/faster-whisper",
+  "initial_prompt": "以下是中文大学物理课堂录音，请使用简体中文准确转写专业术语。",
+  "hotwords": "刚体 转动惯量 转动定律 角动量 角动量守恒 动能定理 质点"
+}

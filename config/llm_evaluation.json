@@ -1,0 +1,11 @@
+{
+  "base_url": "https://api.xiaomimimo.com/v1/chat/completions",
+  "model": "mimo-v2.5",
+  "api_key_env": "LLM_API_KEY",
+  "max_concurrency": 5,
+  "timeout_sec": 120.0,
+  "max_retries": 3,
+  "temperature": 0.0,
+  "response_format_mode": "json_object",
+  "image_detail": "high"
+}
