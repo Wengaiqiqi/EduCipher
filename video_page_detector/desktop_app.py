@@ -24,9 +24,13 @@ from .transcription import (
     format_timestamp,
     transcribe_video_pages,
 )
+from .mimo_asr import resolve_mimo_api_key
 
 
 APP_NAME = "课堂PPT智能处理"
+APP_VERSION = "1.1.0"
+LOCAL_ASR_LABEL = "本地 faster-whisper"
+MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 VIDEO_FILE_TYPES = [
     ("视频文件", "*.mp4 *.mkv *.mov *.avi *.wmv *.m4v *.webm"),
     ("所有文件", "*.*"),
@@ -299,7 +303,7 @@ class DesktopApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(f"{APP_NAME} 1.0")
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         window_width = min(1100, max(960, self.root.winfo_screenwidth() - 80))
         window_height = min(800, max(700, self.root.winfo_screenheight() - 80))
         position_x = max(0, (self.root.winfo_screenwidth() - window_width) // 2)
@@ -328,7 +332,11 @@ class DesktopApp:
         self.result_var = tk.StringVar()
         self.transcript_var = tk.StringVar()
 
+        self.asr_engine_var = tk.StringVar(value=LOCAL_ASR_LABEL)
         self.asr_model_var = tk.StringVar(value="small")
+        self.asr_api_key_var = tk.StringVar()
+        self.asr_concurrency_var = tk.StringVar(value="3")
+        self.asr_upload_consent_var = tk.BooleanVar(value=False)
         self.hotwords_var = tk.StringVar(
             value=(
                 "刚体 转动惯量 转动定律 角动量 角动量守恒 "
@@ -708,38 +716,95 @@ class DesktopApp:
         asr_card.pack(fill="x")
         asr_card.columnconfigure(1, weight=1)
         ttk.Label(
-            asr_card, text="本地语音识别", style="CardTitle.TLabel"
+            asr_card, text="语音识别", style="CardTitle.TLabel"
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
         ttk.Label(
-            asr_card, text="语音模型", style="CardText.TLabel"
+            asr_card, text="识别方式", style="CardText.TLabel"
         ).grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Combobox(
+            asr_card,
+            textvariable=self.asr_engine_var,
+            values=(LOCAL_ASR_LABEL, MIMO_ASR_LABEL),
+            state="readonly",
+            width=28,
+        ).grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Label(
+            asr_card,
+            text="云端更快；本地模式不上传课堂音频",
+            style="Help.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=5)
+        ttk.Label(
+            asr_card, text="本地模型", style="CardText.TLabel"
+        ).grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
         ttk.Combobox(
             asr_card,
             textvariable=self.asr_model_var,
             values=("tiny", "base", "small", "medium", "large-v3"),
             state="readonly",
             width=20,
-        ).grid(row=1, column=1, sticky="w", pady=5)
+        ).grid(row=2, column=1, sticky="w", pady=5)
         ttk.Label(
             asr_card,
-            text="发布版内置 small 模型；其他模型首次使用可能需要下载",
-            style="Help.TLabel",
-            wraplength=270,
-            justify="left",
-        ).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=5)
-        ttk.Label(
-            asr_card, text="专业词汇", style="CardText.TLabel"
-        ).grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
-        ttk.Entry(asr_card, textvariable=self.hotwords_var).grid(
-            row=2, column=1, sticky="ew", pady=5
-        )
-        ttk.Label(
-            asr_card,
-            text="用空格分隔，可根据课程内容修改",
+            text="仅本地模式使用；发布版内置 small 模型",
             style="Help.TLabel",
             wraplength=270,
             justify="left",
         ).grid(row=2, column=2, sticky="w", padx=(12, 0), pady=5)
+        ttk.Label(
+            asr_card, text="专业词汇", style="CardText.TLabel"
+        ).grid(row=3, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Entry(asr_card, textvariable=self.hotwords_var).grid(
+            row=3, column=1, sticky="ew", pady=5
+        )
+        ttk.Label(
+            asr_card,
+            text="本地模式使用；用空格分隔",
+            style="Help.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=5)
+        ttk.Label(
+            asr_card, text="小米ASR Key", style="CardText.TLabel"
+        ).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Entry(
+            asr_card,
+            textvariable=self.asr_api_key_var,
+            show="●",
+        ).grid(row=4, column=1, sticky="ew", pady=5)
+        ttk.Label(
+            asr_card,
+            text="只在内存中使用；留空时读取MIMO_API_KEY或复用下方Key",
+            style="Help.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=5)
+        ttk.Label(
+            asr_card, text="云端并发", style="CardText.TLabel"
+        ).grid(row=5, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Spinbox(
+            asr_card,
+            from_=1,
+            to=10,
+            textvariable=self.asr_concurrency_var,
+            width=8,
+        ).grid(row=5, column=1, sticky="w", pady=5)
+        ttk.Label(
+            asr_card,
+            text="默认3；服务限流时调低",
+            style="Help.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=5, column=2, sticky="w", padx=(12, 0), pady=5)
+        ttk.Checkbutton(
+            asr_card,
+            text=(
+                "我确认允许把按PPT时间截取的临时音频发送给小米MiMo；"
+                "请求结束后立即删除音频"
+            ),
+            variable=self.asr_upload_consent_var,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         llm_card = ttk.Frame(parent, style="Card.TFrame", padding=18)
         llm_card.pack(fill="x", pady=(14, 0))
@@ -892,7 +957,9 @@ class DesktopApp:
         mapping = {
             "output_root": self.output_var,
             "preset": self.preset_var,
+            "asr_engine": self.asr_engine_var,
             "asr_model": self.asr_model_var,
+            "asr_concurrency": self.asr_concurrency_var,
             "hotwords": self.hotwords_var,
             "base_url": self.base_url_var,
             "llm_model": self.llm_model_var,
@@ -911,7 +978,9 @@ class DesktopApp:
             "output_root": self.output_var.get().strip(),
             "preset": self.preset_var.get(),
             "include_llm": bool(self.include_llm_var.get()),
+            "asr_engine": self.asr_engine_var.get(),
             "asr_model": self.asr_model_var.get(),
+            "asr_concurrency": self.asr_concurrency_var.get().strip(),
             "hotwords": self.hotwords_var.get().strip(),
             "base_url": self.base_url_var.get().strip(),
             "llm_model": self.llm_model_var.get().strip(),
@@ -1001,12 +1070,36 @@ class DesktopApp:
         model_root = resource_path("models/faster-whisper")
         config = replace(
             base,
+            engine=(
+                "mimo-cloud"
+                if self.asr_engine_var.get() == MIMO_ASR_LABEL
+                else "faster-whisper"
+            ),
             model=self.asr_model_var.get().strip(),
             hotwords=self.hotwords_var.get().strip() or None,
+            mimo_max_concurrency=int(self.asr_concurrency_var.get()),
             model_download_root=str(model_root),
+            ffmpeg_path=self._bundled_binary("ffmpeg.exe"),
         )
         config.validate()
         return config
+
+    def _require_asr_api_key(
+        self,
+        config: TranscriptionConfig,
+    ) -> str | None:
+        if config.engine != "mimo-cloud":
+            return None
+        if not self.asr_upload_consent_var.get():
+            raise ValueError(
+                "请在“模型与设置”中确认允许发送临时课堂音频给小米MiMo。"
+            )
+        return resolve_mimo_api_key(
+            config.mimo_api_key_env,
+            self.asr_api_key_var.get().strip()
+            or self.api_key_var.get().strip()
+            or None,
+        )
 
     def _llm_config(self) -> LLMEvaluationConfig:
         config_path = resource_path("config/llm_evaluation.json")
@@ -1048,6 +1141,9 @@ class DesktopApp:
             )
             detector_config = self._detector_config()
             transcription_config = self._transcription_config()
+            asr_api_key = self._require_asr_api_key(
+                transcription_config
+            )
             llm_inputs = (
                 self._require_llm_inputs()
                 if self.include_llm_var.get()
@@ -1065,6 +1161,7 @@ class DesktopApp:
             paths=paths,
             detector_config=detector_config,
             transcription_config=transcription_config,
+            asr_api_key=asr_api_key,
             llm_inputs=llm_inputs,
         )
 
@@ -1099,6 +1196,9 @@ class DesktopApp:
             if not result_path.is_file():
                 raise ValueError("请选择有效的 result.json。")
             transcription_config = self._transcription_config()
+            asr_api_key = self._require_asr_api_key(
+                transcription_config
+            )
             paths = build_workflow_paths(
                 result_path.parent.parent,
                 result_path.parent.name,
@@ -1113,6 +1213,7 @@ class DesktopApp:
             paths=paths,
             result_path=result_path,
             transcription_config=transcription_config,
+            asr_api_key=asr_api_key,
         )
 
     def _start_evaluate_only(self) -> None:
@@ -1209,6 +1310,7 @@ class DesktopApp:
                     result_path,
                     config=kwargs["transcription_config"],
                     output_dir=paths.run_dir,
+                    api_key=kwargs.get("asr_api_key"),
                     progress_callback=lambda message, value: self._put_progress(
                         "语音转写",
                         message,
@@ -1258,6 +1360,7 @@ class DesktopApp:
             )
         finally:
             kwargs["llm_inputs"] = None
+            kwargs["asr_api_key"] = None
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -1350,6 +1453,8 @@ class DesktopApp:
                 self.last_report = Path(str(report))
                 self.open_report_button.configure(state="normal")
         self.api_key_var.set("")
+        self.asr_api_key_var.set("")
+        self.asr_upload_consent_var.set(False)
         self.upload_consent_var.set(False)
         self._append_log("处理完成。API Key已从界面内存清空。")
         messagebox.showinfo(
@@ -1397,6 +1502,8 @@ class DesktopApp:
         self.stage_var.set("失败")
         self.status_var.set("处理失败")
         self.api_key_var.set("")
+        self.asr_api_key_var.set("")
+        self.asr_upload_consent_var.set(False)
         self.upload_consent_var.set(False)
         self._append_log(f"处理失败：{message}")
         self._append_log(details)
@@ -1479,6 +1586,7 @@ class DesktopApp:
         ):
             return
         self.api_key_var.set("")
+        self.asr_api_key_var.set("")
         self.root.destroy()
 
 

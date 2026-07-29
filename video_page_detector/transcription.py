@@ -6,9 +6,18 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from .mimo_asr import (
+    AudioExtractor,
+    MimoASRSettings,
+    MimoRequester,
+    resolve_mimo_api_key,
+    transcribe_pages_with_mimo,
+)
+
 
 @dataclass(frozen=True)
 class TranscriptionConfig:
+    engine: str = "faster-whisper"
     model: str = "small"
     language: str | None = "zh"
     device: str = "cpu"
@@ -22,6 +31,14 @@ class TranscriptionConfig:
     hotwords: str | None = (
         "刚体 转动惯量 转动定律 角动量 角动量守恒 动能定理 质点"
     )
+    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
+    mimo_model: str = "mimo-v2.5-asr"
+    mimo_api_key_env: str = "MIMO_API_KEY"
+    mimo_language: str = "auto"
+    mimo_max_concurrency: int = 3
+    mimo_timeout_sec: float = 180.0
+    mimo_max_retries: int = 3
+    ffmpeg_path: str | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TranscriptionConfig":
@@ -47,6 +64,10 @@ class TranscriptionConfig:
         return cls.from_mapping(data)
 
     def validate(self) -> None:
+        if self.engine not in {"faster-whisper", "mimo-cloud"}:
+            raise ValueError(
+                "transcription engine must be faster-whisper or mimo-cloud"
+            )
         if not self.model.strip():
             raise ValueError("transcription model must not be empty")
         if self.language is not None and not self.language.strip():
@@ -55,6 +76,17 @@ class TranscriptionConfig:
             raise ValueError("device must be cpu, cuda, or auto")
         if self.beam_size < 1:
             raise ValueError("beam_size must be positive")
+        MimoASRSettings(
+            base_url=self.mimo_base_url,
+            model=self.mimo_model,
+            language=self.mimo_language,
+            max_concurrency=self.mimo_max_concurrency,
+            timeout_sec=self.mimo_timeout_sec,
+            max_retries=self.mimo_max_retries,
+            ffmpeg_path=self.ffmpeg_path,
+        ).validate()
+        if not self.mimo_api_key_env.strip():
+            raise ValueError("mimo_api_key_env must not be empty")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -287,6 +319,9 @@ def transcribe_video_pages(
     output_dir: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
     model_factory: ModelFactory | None = None,
+    api_key: str | None = None,
+    cloud_requester: MimoRequester | None = None,
+    audio_extractor: AudioExtractor | None = None,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     video = Path(video_path)
@@ -306,6 +341,82 @@ def transcribe_video_pages(
     def report(message: str, progress: float | None) -> None:
         if progress_callback is not None:
             progress_callback(message, progress)
+
+    if config.engine == "mimo-cloud":
+        report("正在准备按PPT页面提取临时音频", 0.02)
+        resolved_api_key = resolve_mimo_api_key(
+            config.mimo_api_key_env,
+            api_key,
+        )
+        settings = MimoASRSettings(
+            base_url=config.mimo_base_url,
+            model=config.mimo_model,
+            language=config.mimo_language,
+            max_concurrency=config.mimo_max_concurrency,
+            timeout_sec=config.mimo_timeout_sec,
+            max_retries=config.mimo_max_retries,
+            ffmpeg_path=config.ffmpeg_path,
+        )
+        page_transcripts, cloud_statistics = transcribe_pages_with_mimo(
+            video,
+            pages,
+            settings=settings,
+            api_key=resolved_api_key,
+            progress_callback=lambda message, completed, total: report(
+                message,
+                min(0.94, 0.04 + completed / max(total, 1) * 0.90),
+            ),
+            requester=cloud_requester,
+            audio_extractor=audio_extractor,
+        )
+        utterance_count = sum(
+            len(page.get("utterances", [])) for page in page_transcripts
+        )
+        payload: dict[str, Any] = {
+            "video_id": str(source_result.get("video_id", video.stem)),
+            "video_path": video.resolve().as_posix(),
+            "video_duration_sec": (
+                round(video_duration, 3)
+                if video_duration is not None
+                else None
+            ),
+            "ppt_result_path": Path(result_path).resolve().as_posix(),
+            "processing_duration_sec": round(
+                time.perf_counter() - started_at, 3
+            ),
+            "transcription": {
+                "engine": "mimo-cloud",
+                "model": config.mimo_model,
+                "language": config.mimo_language,
+                "language_probability": None,
+                "speaker_diarization": False,
+                "oral_filler_cleanup": False,
+                "audio_files_retained": False,
+                "utterance_count": utterance_count,
+                "cloud_statistics": cloud_statistics,
+            },
+            "pages": page_transcripts,
+            "config": config.to_dict(),
+        }
+        transcript_path = destination / "transcript.json"
+        markdown_path = destination / "逐页语音文字.md"
+        payload["artifacts"] = {
+            "transcript_json": transcript_path.resolve().as_posix(),
+            "page_transcript_markdown": markdown_path.resolve().as_posix(),
+        }
+        transcript_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        markdown_path.write_text(
+            render_page_transcripts_markdown(
+                payload["video_id"],
+                page_transcripts,
+            ),
+            encoding="utf-8",
+        )
+        report("小米云端语音文字处理完成，临时音频已删除", 1.0)
+        return payload
 
     report("正在加载本地语音识别模型", 0.02)
     factory = model_factory or _default_model_factory

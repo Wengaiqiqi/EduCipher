@@ -79,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="临时覆盖模型名称，例如 tiny、base、small、medium",
     )
     transcribe.add_argument(
+        "--engine",
+        choices=("faster-whisper", "mimo-cloud"),
+        help="临时覆盖语音引擎；小米云端从MIMO_API_KEY读取密钥",
+    )
+    transcribe.add_argument(
         "--beam-size",
         type=int,
         help="临时覆盖搜索宽度；CPU 推荐 1",
@@ -152,10 +157,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "transcribe":
             config = TranscriptionConfig.from_file(args.config)
-            if args.model or args.beam_size:
+            if args.engine or args.model or args.beam_size:
                 config = TranscriptionConfig.from_mapping(
                     {
                         **config.to_dict(),
+                        **({"engine": args.engine} if args.engine else {}),
                         **({"model": args.model} if args.model else {}),
                         **(
                             {"beam_size": args.beam_size}

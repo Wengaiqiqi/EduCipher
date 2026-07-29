@@ -18,6 +18,11 @@ from .transcription import (
     format_timestamp,
     transcribe_video_pages,
 )
+from .mimo_asr import resolve_mimo_api_key
+
+
+LOCAL_ASR_LABEL = "本地 faster-whisper"
+MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 
 
 def open_external(path: Path) -> None:
@@ -40,8 +45,8 @@ class TranscriptionApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("PPT 逐页语音转文字")
-        self.root.geometry("980x760")
-        self.root.minsize(850, 650)
+        self.root.geometry("1040x860")
+        self.root.minsize(900, 720)
         self.root.configure(background=self.BACKGROUND)
 
         self.events: queue.Queue[tuple[object, ...]] = queue.Queue()
@@ -56,7 +61,11 @@ class TranscriptionApp:
         self.config_var = tk.StringVar(
             value=str(Path.cwd() / "config" / "transcription.json")
         )
+        self.engine_var = tk.StringVar(value=LOCAL_ASR_LABEL)
         self.model_var = tk.StringVar(value="small")
+        self.api_key_var = tk.StringVar()
+        self.concurrency_var = tk.StringVar(value="3")
+        self.upload_consent_var = tk.BooleanVar(value=False)
         self.hotwords_var = tk.StringVar(
             value=(
                 "刚体 转动惯量 转动定律 角动量 "
@@ -167,9 +176,27 @@ class TranscriptionApp:
 
         ttk.Label(
             input_card,
-            text="识别模型",
+            text="识别方式",
             style="CardText.TLabel",
         ).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Combobox(
+            input_card,
+            textvariable=self.engine_var,
+            values=(LOCAL_ASR_LABEL, MIMO_ASR_LABEL),
+            state="readonly",
+            width=28,
+        ).grid(row=4, column=1, sticky="w", pady=5)
+        ttk.Label(
+            input_card,
+            text="云端更快；本地模式不上传课堂音频",
+            style="Help.TLabel",
+        ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=5)
+
+        ttk.Label(
+            input_card,
+            text="本地模型",
+            style="CardText.TLabel",
+        ).grid(row=5, column=0, sticky="w", padx=(0, 12), pady=5)
         model_box = ttk.Combobox(
             input_card,
             textvariable=self.model_var,
@@ -177,30 +204,70 @@ class TranscriptionApp:
             state="readonly",
             width=18,
         )
-        model_box.grid(row=4, column=1, sticky="w", pady=5)
+        model_box.grid(row=5, column=1, sticky="w", pady=5)
         ttk.Label(
             input_card,
-            text="推荐 small；模型越大越准确，但首次下载和CPU处理越慢",
+            text="仅本地模式使用；推荐 small",
             style="Help.TLabel",
-        ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=5)
+        ).grid(row=5, column=2, sticky="w", padx=(12, 0), pady=5)
 
         ttk.Label(
             input_card,
             text="专业词汇",
             style="CardText.TLabel",
-        ).grid(row=5, column=0, sticky="w", padx=(0, 12), pady=5)
+        ).grid(row=6, column=0, sticky="w", padx=(0, 12), pady=5)
         ttk.Entry(
             input_card,
             textvariable=self.hotwords_var,
-        ).grid(row=5, column=1, sticky="ew", pady=5)
+        ).grid(row=6, column=1, sticky="ew", pady=5)
         ttk.Label(
             input_card,
-            text="用空格分隔，可按课程内容增删；用于提高术语识别率",
+            text="本地模式使用；用空格分隔",
             style="Help.TLabel",
-        ).grid(row=5, column=2, sticky="w", padx=(12, 0), pady=5)
+        ).grid(row=6, column=2, sticky="w", padx=(12, 0), pady=5)
+
+        ttk.Label(
+            input_card,
+            text="小米ASR Key",
+            style="CardText.TLabel",
+        ).grid(row=7, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Entry(
+            input_card,
+            textvariable=self.api_key_var,
+            show="●",
+        ).grid(row=7, column=1, sticky="ew", pady=5)
+        ttk.Label(
+            input_card,
+            text="只在内存中使用；留空时读取MIMO_API_KEY或LLM_API_KEY",
+            style="Help.TLabel",
+        ).grid(row=7, column=2, sticky="w", padx=(12, 0), pady=5)
+
+        ttk.Label(
+            input_card,
+            text="云端并发",
+            style="CardText.TLabel",
+        ).grid(row=8, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Spinbox(
+            input_card,
+            from_=1,
+            to=10,
+            textvariable=self.concurrency_var,
+            width=8,
+        ).grid(row=8, column=1, sticky="w", pady=5)
+        ttk.Checkbutton(
+            input_card,
+            text="允许把临时音频发送给小米MiMo；完成后立即删除",
+            variable=self.upload_consent_var,
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         action_row = ttk.Frame(input_card, style="Card.TFrame")
-        action_row.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        action_row.grid(
+            row=10,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(12, 0),
+        )
         self.start_button = ttk.Button(
             action_row,
             text="开始转成逐页文字",
@@ -380,13 +447,35 @@ class TranscriptionApp:
             )
             config = replace(
                 config,
+                engine=(
+                    "mimo-cloud"
+                    if self.engine_var.get() == MIMO_ASR_LABEL
+                    else "faster-whisper"
+                ),
                 model=self.model_var.get().strip(),
                 hotwords=self.hotwords_var.get().strip() or None,
+                mimo_max_concurrency=int(self.concurrency_var.get()),
             )
             config.validate()
         except ValueError as exc:
             messagebox.showerror("配置错误", str(exc))
             return
+        api_key: str | None = None
+        if config.engine == "mimo-cloud":
+            if not self.upload_consent_var.get():
+                messagebox.showerror(
+                    "无法开始",
+                    "请确认允许把临时课堂音频发送给小米MiMo。",
+                )
+                return
+            try:
+                api_key = resolve_mimo_api_key(
+                    config.mimo_api_key_env,
+                    self.api_key_var.get().strip() or None,
+                )
+            except ValueError as exc:
+                messagebox.showerror("无法开始", str(exc))
+                return
 
         self.running = True
         self.progress_var.set(0)
@@ -410,6 +499,7 @@ class TranscriptionApp:
                     result,
                     config=config,
                     output_dir=output,
+                    api_key=api_key,
                     progress_callback=progress,
                 )
                 self.events.put(("complete", payload))
@@ -469,11 +559,15 @@ class TranscriptionApp:
         self.open_markdown_button.configure(state="normal")
         self.open_output_button.configure(state="normal")
         self._append_log("处理完成，未保留任何音频文件。")
+        self.api_key_var.set("")
+        self.upload_consent_var.set(False)
 
     def _fail(self, details: str) -> None:
         self.running = False
         self.start_button.configure(state="normal")
         self.status_var.set("处理失败")
+        self.api_key_var.set("")
+        self.upload_consent_var.set(False)
         self._append_log(details)
         messagebox.showerror(
             "语音识别失败",
