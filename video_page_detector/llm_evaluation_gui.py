@@ -54,6 +54,7 @@ class LLMEvaluationApp:
         self.model_var = tk.StringVar(value="gpt-4o-mini")
         self.api_key_var = tk.StringVar()
         self.concurrency_var = tk.StringVar(value="5")
+        self.include_evidence_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择 transcript.json")
         self.progress_var = tk.DoubleVar(value=0)
 
@@ -119,7 +120,7 @@ class LLMEvaluationApp:
             main,
             text=(
                 "每页独立发送PPT截图和讲话文字，默认并发5；"
-                "密钥只在本次运行内存中使用，不写入配置文件"
+                "默认仅返回分数和理由，可按需开启详细证据"
             ),
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(4, 14))
@@ -197,8 +198,14 @@ class LLMEvaluationApp:
             style="Help.TLabel",
         ).grid(row=6, column=2, sticky="w", padx=(12, 0), pady=5)
 
+        ttk.Checkbutton(
+            input_card,
+            text="返回详细对应证据（增加Token消耗）",
+            variable=self.include_evidence_var,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         action_row = ttk.Frame(input_card, style="Card.TFrame")
-        action_row.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        action_row.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         self.start_button = ttk.Button(
             action_row,
             text="开始关联度评估",
@@ -378,6 +385,7 @@ class LLMEvaluationApp:
         self.base_url_var.set(config.base_url)
         self.model_var.set(config.model)
         self.concurrency_var.set(str(config.max_concurrency))
+        self.include_evidence_var.set(config.include_evidence)
 
     def _choose_transcript(self) -> None:
         selected = filedialog.askopenfilename(
@@ -423,6 +431,7 @@ class LLMEvaluationApp:
                 base_url=self.base_url_var.get().strip(),
                 model=self.model_var.get().strip(),
                 max_concurrency=concurrency,
+                include_evidence=bool(self.include_evidence_var.get()),
             )
             config.validate()
         except (TypeError, ValueError) as exc:

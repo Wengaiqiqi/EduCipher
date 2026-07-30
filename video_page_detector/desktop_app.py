@@ -28,7 +28,7 @@ from .mimo_asr import resolve_mimo_api_key
 
 
 APP_NAME = "课堂PPT智能处理"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 LOCAL_ASR_LABEL = "本地 faster-whisper"
 MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 VIDEO_FILE_TYPES = [
@@ -347,6 +347,7 @@ class DesktopApp:
         self.llm_model_var = tk.StringVar(value="gpt-4o-mini")
         self.api_key_var = tk.StringVar()
         self.concurrency_var = tk.StringVar(value="5")
+        self.llm_include_evidence_var = tk.BooleanVar(value=False)
         self.upload_consent_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="请选择一个课堂视频")
@@ -858,11 +859,16 @@ class DesktopApp:
         ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=5)
         ttk.Checkbutton(
             llm_card,
+            text="返回详细对应证据（增加Token消耗）",
+            variable=self.llm_include_evidence_var,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(
+            llm_card,
             text=(
                 "我确认允许把PPT截图和对应课堂转写发送给上述LLM服务"
             ),
             variable=self.upload_consent_var,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         footer = ttk.Frame(parent, style="App.TFrame")
         footer.pack(fill="x", pady=(14, 0))
@@ -943,6 +949,9 @@ class DesktopApp:
                 self.base_url_var.set(llm_config.base_url)
                 self.llm_model_var.set(llm_config.model)
                 self.concurrency_var.set(str(llm_config.max_concurrency))
+                self.llm_include_evidence_var.set(
+                    llm_config.include_evidence
+                )
             except (OSError, ValueError):
                 pass
         saved_path = settings_path()
@@ -972,6 +981,9 @@ class DesktopApp:
         include_llm = data.get("include_llm")
         if isinstance(include_llm, bool):
             self.include_llm_var.set(include_llm)
+        include_evidence = data.get("llm_include_evidence")
+        if isinstance(include_evidence, bool):
+            self.llm_include_evidence_var.set(include_evidence)
 
     def _save_settings(self) -> None:
         payload = {
@@ -985,6 +997,9 @@ class DesktopApp:
             "base_url": self.base_url_var.get().strip(),
             "llm_model": self.llm_model_var.get().strip(),
             "concurrency": self.concurrency_var.get().strip(),
+            "llm_include_evidence": bool(
+                self.llm_include_evidence_var.get()
+            ),
         }
         path = settings_path()
         try:
@@ -1113,6 +1128,7 @@ class DesktopApp:
             base_url=self.base_url_var.get().strip(),
             model=self.llm_model_var.get().strip(),
             max_concurrency=int(self.concurrency_var.get()),
+            include_evidence=bool(self.llm_include_evidence_var.get()),
         )
         config.validate()
         return config

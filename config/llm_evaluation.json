@@ -7,5 +7,6 @@
   "max_retries": 3,
   "temperature": 0.0,
   "response_format_mode": "json_object",
-  "image_detail": "high"
+  "image_detail": "high",
+  "include_evidence": false
 }

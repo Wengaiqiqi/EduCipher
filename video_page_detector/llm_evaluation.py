@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 
-PROMPT_VERSION = "ppt_speech_relevance_v2_plain_speech"
+PROMPT_VERSION = "ppt_speech_relevance_v3_optional_evidence"
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class LLMEvaluationConfig:
     temperature: float = 0.0
     response_format_mode: str = "json_object"
     image_detail: str = "high"
+    include_evidence: bool = False
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "LLMEvaluationConfig":
@@ -72,6 +73,8 @@ class LLMEvaluationConfig:
             )
         if self.image_detail not in {"auto", "low", "high"}:
             raise ValueError("image_detail must be auto, low, or high")
+        if not isinstance(self.include_evidence, bool):
+            raise ValueError("include_evidence must be true or false")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -128,6 +131,7 @@ def _page_input_fingerprint(
     digest = hashlib.sha256()
     digest.update(PROMPT_VERSION.encode("utf-8"))
     digest.update(config.model.encode("utf-8"))
+    digest.update(str(config.include_evidence).encode("ascii"))
     digest.update(str(page.get("start_sec")).encode("utf-8"))
     digest.update(str(page.get("end_sec")).encode("utf-8"))
     digest.update(_page_utterance_text(page).encode("utf-8"))
@@ -135,12 +139,11 @@ def _page_input_fingerprint(
     return digest.hexdigest()
 
 
-def _system_prompt() -> str:
-    return """
+def _system_prompt(include_evidence: bool) -> str:
+    shared = """
 你是课堂教学内容评估员。请根据一张PPT截图和该页展示期间的讲话文字，
 判断讲话内容与当前PPT的关联程度。
 
-先分别提取PPT与讲话的关键点，再列出双方的明确对应证据，最后评分。
 不要因为老师没有逐字讲完PPT上的全部内容就判为不相关。
 明显的语音识别同音字、简繁体或专业术语错字，应结合PPT语境理解，不直接扣分。
 讲话文字已经由程序按照当前PPT的起止时间完成归页，不需要推断或输出时间信息。
@@ -153,20 +156,42 @@ def _system_prompt() -> str:
 不要输出最终加权分，程序会按：
 speech_relevance×60% + ppt_coverage×25% + evidence_consistency×15%
 统一计算。
+""".strip()
+    if not include_evidence:
+        return (
+            shared
+            + "\n\n"
+            + """
 
 只返回一个JSON对象，不要输出Markdown代码块。字段必须是：
-{{
+{
+  "speech_relevance": 0,
+  "ppt_coverage": 0,
+  "evidence_consistency": 0,
+  "reason": "用一段简洁完整的中文说明评分原因"
+}
+""".strip()
+        )
+    return (
+        shared
+        + "\n\n"
+        + """
+
+先分别提取PPT与讲话的关键点，再列出双方的明确对应证据，最后评分。
+只返回一个JSON对象，不要输出Markdown代码块。字段必须是：
+{
   "ppt_key_points": ["..."],
   "speech_key_points": ["..."],
-  "matched_evidence": [{{"ppt": "...", "speech": "..."}}],
+  "matched_evidence": [{"ppt": "...", "speech": "..."}],
   "unrelated_content": ["..."],
   "speech_relevance": 0,
   "ppt_coverage": 0,
   "evidence_consistency": 0,
   "reason": "...",
   "confidence": 0.0
-}}
+}
 """.strip()
+    )
 
 
 def build_chat_payload(
@@ -188,7 +213,7 @@ def build_chat_payload(
         "messages": [
             {
                 "role": "system",
-                "content": _system_prompt(),
+                "content": _system_prompt(config.include_evidence),
             },
             {
                 "role": "user",
@@ -305,6 +330,7 @@ def normalize_page_evaluation(
     *,
     page: Mapping[str, Any],
     fingerprint: str,
+    include_evidence: bool = False,
 ) -> dict[str, Any]:
     speech_relevance = _score_value(raw, "speech_relevance")
     ppt_coverage = _score_value(raw, "ppt_coverage")
@@ -320,7 +346,7 @@ def normalize_page_evaluation(
         confidence = float(raw.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
-    return {
+    result: dict[str, Any] = {
         "page_id": int(page["page_id"]),
         "start_sec": round(float(page["start_sec"]), 3),
         "end_sec": round(float(page["end_sec"]), 3),
@@ -331,13 +357,19 @@ def normalize_page_evaluation(
         "evidence_consistency": evidence_consistency,
         "score": score,
         "level": score_level(score),
-        "ppt_key_points": _string_list(raw, "ppt_key_points"),
-        "speech_key_points": _string_list(raw, "speech_key_points"),
-        "matched_evidence": _evidence_list(raw),
-        "unrelated_content": _string_list(raw, "unrelated_content"),
         "reason": str(raw.get("reason", "")).strip(),
-        "confidence": round(min(1.0, max(0.0, confidence)), 4),
     }
+    if include_evidence:
+        result.update(
+            {
+                "ppt_key_points": _string_list(raw, "ppt_key_points"),
+                "speech_key_points": _string_list(raw, "speech_key_points"),
+                "matched_evidence": _evidence_list(raw),
+                "unrelated_content": _string_list(raw, "unrelated_content"),
+                "confidence": round(min(1.0, max(0.0, confidence)), 4),
+            }
+        )
+    return result
 
 
 def _no_speech_evaluation(
@@ -515,6 +547,9 @@ def summarize_evaluations(
 
 def render_evaluation_markdown(result: Mapping[str, Any]) -> str:
     summary = result["summary"]
+    include_evidence = bool(
+        result.get("config", {}).get("include_evidence", False)
+    )
     lines = [
         f"# {result['video_id']} PPT与讲话关联度评估",
         "",
@@ -530,15 +565,23 @@ def render_evaluation_markdown(result: Mapping[str, Any]) -> str:
         ),
         f"- 纯关联平均分：{summary['association_average_score']}",
         f"- 讲话页面覆盖率：{summary['speech_page_coverage_percent']}%",
-        "",
-        "| 页码 | 状态 | 讲话相关度 | PPT覆盖度 | 证据一致性 | 页面分数 | 等级 |",
-        "|---:|---|---:|---:|---:|---:|---|",
     ]
-    for page in result["pages"]:
-        lines.append(
-            "| {page_id} | {status} | {speech_relevance} | {ppt_coverage} | "
-            "{evidence_consistency} | {score} | {level} |".format(**page)
+    if include_evidence:
+        lines.extend(
+            [
+                "- 详细对应证据：已开启",
+                "",
+                "| 页码 | 状态 | 讲话相关度 | PPT覆盖度 | "
+                "证据一致性 | 页面分数 | 等级 |",
+                "|---:|---|---:|---:|---:|---:|---|",
+            ]
         )
+        for page in result["pages"]:
+            lines.append(
+                "| {page_id} | {status} | {speech_relevance} | "
+                "{ppt_coverage} | {evidence_consistency} | "
+                "{score} | {level} |".format(**page)
+            )
     for page in result["pages"]:
         lines.extend(
             [
@@ -549,7 +592,7 @@ def render_evaluation_markdown(result: Mapping[str, Any]) -> str:
                 "",
             ]
         )
-        evidence = page.get("matched_evidence", [])
+        evidence = page.get("matched_evidence", []) if include_evidence else []
         if evidence:
             lines.append("对应证据：")
             lines.append("")
@@ -640,6 +683,7 @@ async def evaluate_transcript_async(
                     raw,
                     page=page,
                     fingerprint=fingerprint,
+                    include_evidence=config.include_evidence,
                 )
             except Exception as exc:
                 result = {
