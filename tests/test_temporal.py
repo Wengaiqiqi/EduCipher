@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from video_page_detector.temporal import (
+    IncrementalTemporalSegmenter,
     TemporalFeature,
     choose_representative_index,
     find_state_crossover,
@@ -20,6 +21,17 @@ def _feature(timestamp: float, value: int, information: float = 0.1) -> Temporal
 
 
 class TemporalSegmentationTests(unittest.TestCase):
+    @staticmethod
+    def _segmenter() -> IncrementalTemporalSegmenter:
+        return IncrementalTemporalSegmenter(
+            confirmation_samples=3,
+            changed_block_ratio=0.5,
+            block_distance_threshold=10,
+            stability_distance=12,
+            minimum_segment_samples=3,
+            same_content_similarity=0.8,
+        )
+
     def test_persistent_change_creates_new_segment(self) -> None:
         features = [
             *[_feature(index * 2, 0) for index in range(6)],
@@ -131,3 +143,42 @@ class TemporalSegmentationTests(unittest.TestCase):
             persistence=2,
         )
         self.assertEqual(crossover, 2)
+
+    def test_incremental_segmentation_matches_batch_result(self) -> None:
+        features = [
+            *[_feature(index * 2, 0) for index in range(6)],
+            *[_feature((index + 6) * 2, 8) for index in range(6)],
+            *[_feature((index + 12) * 2, 0) for index in range(6)],
+            *[_feature((index + 18) * 2, 10) for index in range(6)],
+        ]
+        batch = find_temporal_segments(
+            features,
+            confirmation_samples=3,
+            changed_block_ratio=0.5,
+            minimum_segment_samples=3,
+        )
+        segmenter = self._segmenter()
+        emitted: list = []
+        for start in range(0, len(features), 6):
+            final = start + 6 >= len(features)
+            new_segments, _ = segmenter.extend(
+                features[start : start + 6],
+                final=final,
+            )
+            emitted.extend(new_segments)
+        self.assertEqual(emitted, batch)
+        self.assertEqual(segmenter.confirmed_segments, batch)
+
+    def test_incremental_segmentation_emits_before_final_chunk(self) -> None:
+        features = [
+            *[_feature(index * 2, 0) for index in range(6)],
+            *[_feature((index + 6) * 2, 8) for index in range(6)],
+            *[_feature((index + 12) * 2, 0) for index in range(6)],
+            *[_feature((index + 18) * 2, 10) for index in range(6)],
+        ]
+        segmenter = self._segmenter()
+        early, snapshot = segmenter.extend(features[:18], final=False)
+        self.assertEqual(len(snapshot), 3)
+        self.assertEqual(len(early), 1)
+        remaining, _ = segmenter.extend(features[18:], final=True)
+        self.assertEqual(len([*early, *remaining]), 4)

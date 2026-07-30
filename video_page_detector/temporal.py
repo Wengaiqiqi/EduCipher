@@ -27,6 +27,86 @@ class TemporalSegment:
     confidence: str
 
 
+class IncrementalTemporalSegmenter:
+    """Confirm an immutable segment prefix while feature chunks arrive.
+
+    The newest two segments stay pending because the latest segment still has
+    no confirmed end, and its representative/content signature can affect
+    whether it should merge with the segment immediately before it.
+    """
+
+    def __init__(
+        self,
+        *,
+        confirmation_samples: int,
+        changed_block_ratio: float,
+        block_distance_threshold: int,
+        stability_distance: int,
+        minimum_segment_samples: int,
+        same_content_similarity: float,
+        retained_tail_segments: int = 2,
+    ) -> None:
+        if retained_tail_segments < 2:
+            raise ValueError("retained_tail_segments must be at least 2")
+        self.confirmation_samples = confirmation_samples
+        self.changed_block_ratio = changed_block_ratio
+        self.block_distance_threshold = block_distance_threshold
+        self.stability_distance = stability_distance
+        self.minimum_segment_samples = minimum_segment_samples
+        self.same_content_similarity = same_content_similarity
+        self.retained_tail_segments = retained_tail_segments
+        self.features: list[TemporalFeature] = []
+        self.confirmed_segments: list[TemporalSegment] = []
+        self.latest_segments: list[TemporalSegment] = []
+
+    @staticmethod
+    def _identity(segment: TemporalSegment) -> tuple[int, int, int]:
+        return (
+            segment.start_index,
+            segment.end_index,
+            segment.representative_index,
+        )
+
+    def extend(
+        self,
+        features: Sequence[TemporalFeature],
+        *,
+        final: bool = False,
+    ) -> tuple[list[TemporalSegment], list[TemporalSegment]]:
+        self.features.extend(features)
+        segments = find_temporal_segments(
+            self.features,
+            confirmation_samples=self.confirmation_samples,
+            changed_block_ratio=self.changed_block_ratio,
+            block_distance_threshold=self.block_distance_threshold,
+            stability_distance=self.stability_distance,
+            minimum_segment_samples=self.minimum_segment_samples,
+            same_content_similarity=self.same_content_similarity,
+        )
+        for index, confirmed in enumerate(self.confirmed_segments):
+            if index >= len(segments) or (
+                self._identity(confirmed)
+                != self._identity(segments[index])
+            ):
+                raise RuntimeError(
+                    "增量时序分段回滚了已经确认的页面，"
+                    "需要增加保留的尾部页面数量。"
+                )
+        stable_count = (
+            len(segments)
+            if final
+            else max(0, len(segments) - self.retained_tail_segments)
+        )
+        if stable_count < len(self.confirmed_segments):
+            raise RuntimeError("增量时序分段的稳定前缀缩短。")
+        newly_confirmed = segments[
+            len(self.confirmed_segments) : stable_count
+        ]
+        self.confirmed_segments.extend(newly_confirmed)
+        self.latest_segments = list(segments)
+        return list(newly_confirmed), list(segments)
+
+
 def make_temporal_feature(
     frame: np.ndarray,
     *,
