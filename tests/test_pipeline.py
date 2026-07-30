@@ -79,10 +79,25 @@ class TemporalPipelineIntegrationTests(unittest.TestCase):
                 screen_crop_right_ratio=0.0,
                 screen_crop_bottom_ratio=0.0,
             )
+            ready_pages: list[tuple[int, int, int]] = []
+
+            def page_ready(
+                page: dict[str, object],
+                completed: int,
+                total: int,
+            ) -> None:
+                self.assertTrue(
+                    Path(str(page["screenshot_path"])).is_file()
+                )
+                ready_pages.append(
+                    (int(page["page_id"]), completed, total)
+                )
+
             result = VideoPageDetector(config).run(
                 video,
                 output_root=root / "output",
                 video_id="temporal",
+                page_ready_callback=page_ready,
             )
             output_dir = root / "output" / "temporal"
             self.assertEqual(result["analysis"]["mode"], "temporal")
@@ -101,3 +116,4 @@ class TemporalPipelineIntegrationTests(unittest.TestCase):
                 result["analysis"]["screenshot_resolution"],
                 {"width": 1280, "height": 720},
             )
+            self.assertEqual(ready_pages, [(1, 1, 2), (2, 2, 2)])

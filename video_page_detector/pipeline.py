@@ -30,6 +30,9 @@ class VideoPageDetector:
         output_root: str | Path = "output",
         video_id: str | None = None,
         progress_callback: Callable[[str, float | None], None] | None = None,
+        page_ready_callback: (
+            Callable[[dict[str, Any], int, int], None] | None
+        ) = None,
     ) -> dict[str, Any]:
         def report(message: str, progress: float | None) -> None:
             if progress_callback is not None:
@@ -166,8 +169,7 @@ class VideoPageDetector:
             same_content_similarity=self.config.temporal_same_content_similarity,
         )
 
-        refined_starts = [0.0]
-        for segment_index in range(1, len(segments)):
+        def refine_boundary(segment_index: int) -> float:
             coarse_sec = features[segments[segment_index].start_index].timestamp_sec
             half_window = self.config.temporal_confirmation_sec / 2.0
             window_start = max(0.0, coarse_sec - half_window)
@@ -177,7 +179,7 @@ class VideoPageDetector:
             )
             report(
                 f"正在细化换页时间 {segment_index}/{len(segments) - 1}",
-                0.62 + 0.06 * segment_index / max(1, len(segments) - 1),
+                0.62 + 0.12 * segment_index / max(1, len(segments) - 1),
             )
             boundary_frames = feature_tools.sample_window(
                 source,
@@ -226,11 +228,14 @@ class VideoPageDetector:
                 if crossover is not None
                 else coarse_sec
             )
-            refined_starts.append(refined)
+            return refined
 
+        refined_starts = [0.0]
         output_pages: list[dict[str, Any]] = []
         segment_audit: list[dict[str, Any]] = []
         for page_index, segment in enumerate(segments):
+            if page_index + 1 < len(segments):
+                refined_starts.append(refine_boundary(page_index + 1))
             start_sec = refined_starts[page_index]
             end_sec = (
                 refined_starts[page_index + 1]
@@ -242,7 +247,7 @@ class VideoPageDetector:
             ].timestamp_sec
             report(
                 f"正在提取代表截图 {page_index + 1}/{len(segments)}",
-                0.68 + 0.25 * (page_index + 1) / max(1, len(segments)),
+                0.62 + 0.31 * (page_index + 1) / max(1, len(segments)),
             )
             representative_frames = output_tools.sample_window(
                 source,
@@ -283,6 +288,12 @@ class VideoPageDetector:
             if segment.confidence != "high":
                 record["note"] = "时序变化处于中间地带，建议人工复核"
             output_pages.append(record)
+            if page_ready_callback is not None:
+                page_ready_callback(
+                    dict(record),
+                    page_index + 1,
+                    len(segments),
+                )
             segment_audit.append(
                 {
                     "page_id": page_id,

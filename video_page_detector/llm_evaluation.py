@@ -603,6 +603,98 @@ def render_evaluation_markdown(result: Mapping[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+async def evaluate_page_async(
+    page: Mapping[str, Any],
+    *,
+    transcript_path: str | Path,
+    config: LLMEvaluationConfig,
+    output_dir: str | Path,
+    api_key: str,
+    requester: ModelRequester | None = None,
+) -> dict[str, Any]:
+    config.validate()
+    transcript_file = Path(transcript_path)
+    destination = Path(output_dir)
+    page_dir = destination / "pages"
+    page_dir.mkdir(parents=True, exist_ok=True)
+    page_id = int(page["page_id"])
+    raw_screenshot = page.get("screenshot_path")
+    if not raw_screenshot:
+        raise ValueError(f"page {page_id} has no screenshot_path")
+    screenshot = _resolve_screenshot_path(
+        str(raw_screenshot),
+        transcript_file,
+    )
+    fingerprint = _page_input_fingerprint(page, screenshot, config)
+    cache_path = page_dir / f"page_{page_id:03d}.json"
+    cached = _load_cached_page(cache_path, fingerprint)
+    if cached is not None:
+        return cached
+    if not _page_utterance_text(page):
+        result = _no_speech_evaluation(page, fingerprint)
+        _write_json(cache_path, result)
+        return result
+    try:
+        payload = build_chat_payload(
+            page,
+            screenshot,
+            config,
+            include_response_format=(
+                config.response_format_mode == "json_object"
+            ),
+        )
+        raw = await _request_with_retries(
+            config,
+            api_key,
+            payload,
+            requester,
+        )
+        result = normalize_page_evaluation(
+            raw,
+            page=page,
+            fingerprint=fingerprint,
+            include_evidence=config.include_evidence,
+        )
+    except Exception as exc:
+        result = {
+            "page_id": page_id,
+            "start_sec": round(float(page["start_sec"]), 3),
+            "end_sec": round(float(page["end_sec"]), 3),
+            "status": "failed",
+            "input_fingerprint": fingerprint,
+            "speech_relevance": 0,
+            "ppt_coverage": 0,
+            "evidence_consistency": 0,
+            "score": 0,
+            "level": "请求失败",
+            "reason": str(exc),
+            "matched_evidence": [],
+        }
+    _write_json(cache_path, result)
+    return result
+
+
+def evaluate_page(
+    page: Mapping[str, Any],
+    *,
+    transcript_path: str | Path,
+    config: LLMEvaluationConfig,
+    output_dir: str | Path,
+    api_key: str,
+    requester: ModelRequester | None = None,
+) -> dict[str, Any]:
+    return asyncio.run(
+        evaluate_page_async(
+            page,
+            transcript_path=transcript_path,
+            config=config,
+            output_dir=output_dir,
+            api_key=api_key,
+            requester=requester,
+        )
+    )
+
+
 async def evaluate_transcript_async(
     transcript_path: str | Path,
     *,
@@ -622,8 +714,7 @@ async def evaluate_transcript_async(
         if output_dir is not None
         else transcript_file.resolve().parent / "llm_evaluation"
     )
-    page_dir = destination / "pages"
-    page_dir.mkdir(parents=True, exist_ok=True)
+    (destination / "pages").mkdir(parents=True, exist_ok=True)
     resolved_api_key = api_key or os.environ.get(config.api_key_env, "")
     if requester is None and not resolved_api_key:
         raise ValueError(
@@ -642,70 +733,25 @@ async def evaluate_transcript_async(
             if progress_callback is not None:
                 progress_callback(message, completed, len(pages))
 
-    async def evaluate_page(page: dict[str, Any]) -> dict[str, Any]:
-        page_id = int(page["page_id"])
-        raw_screenshot = page.get("screenshot_path")
-        if not raw_screenshot:
-            raise ValueError(f"page {page_id} has no screenshot_path")
-        screenshot = _resolve_screenshot_path(
-            str(raw_screenshot),
-            transcript_file,
-        )
-        fingerprint = _page_input_fingerprint(page, screenshot, config)
-        cache_path = page_dir / f"page_{page_id:03d}.json"
-        cached = _load_cached_page(cache_path, fingerprint)
-        if cached is not None:
-            await report(f"第 {page_id} 页使用已有结果")
-            return cached
-        if not _page_utterance_text(page):
-            result = _no_speech_evaluation(page, fingerprint)
-            _write_json(cache_path, result)
-            await report(f"第 {page_id} 页没有讲话")
-            return result
-
+    async def evaluate_page_for_batch(
+        page: dict[str, Any],
+    ) -> dict[str, Any]:
         async with semaphore:
-            try:
-                payload = build_chat_payload(
-                    page,
-                    screenshot,
-                    config,
-                    include_response_format=(
-                        config.response_format_mode == "json_object"
-                    ),
-                )
-                raw = await _request_with_retries(
-                    config,
-                    resolved_api_key,
-                    payload,
-                    requester,
-                )
-                result = normalize_page_evaluation(
-                    raw,
-                    page=page,
-                    fingerprint=fingerprint,
-                    include_evidence=config.include_evidence,
-                )
-            except Exception as exc:
-                result = {
-                    "page_id": page_id,
-                    "start_sec": round(float(page["start_sec"]), 3),
-                    "end_sec": round(float(page["end_sec"]), 3),
-                    "status": "failed",
-                    "input_fingerprint": fingerprint,
-                    "speech_relevance": 0,
-                    "ppt_coverage": 0,
-                    "evidence_consistency": 0,
-                    "score": 0,
-                    "level": "请求失败",
-                    "reason": str(exc),
-                    "matched_evidence": [],
-                }
-            _write_json(cache_path, result)
-            await report(f"第 {page_id} 页：{result['status']}")
-            return result
+            result = await evaluate_page_async(
+                page,
+                transcript_path=transcript_file,
+                config=config,
+                output_dir=destination,
+                api_key=resolved_api_key,
+                requester=requester,
+            )
+        await report(f"第 {page['page_id']} 页：{result['status']}")
+        return result
 
     started_at = time.perf_counter()
-    results = await asyncio.gather(*(evaluate_page(page) for page in pages))
+    results = await asyncio.gather(
+        *(evaluate_page_for_batch(page) for page in pages)
+    )
     ordered = sorted(results, key=lambda item: int(item["page_id"]))
     summary = summarize_evaluations(ordered)
     final_result: dict[str, Any] = {
@@ -728,7 +774,7 @@ async def evaluate_transcript_async(
     final_result["artifacts"] = {
         "result_json": result_path.resolve().as_posix(),
         "report_markdown": report_path.resolve().as_posix(),
-        "page_results_dir": page_dir.resolve().as_posix(),
+        "page_results_dir": (destination / "pages").resolve().as_posix(),
     }
     _write_json(result_path, final_result)
     report_path.write_text(

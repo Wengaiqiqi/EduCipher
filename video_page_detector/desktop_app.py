@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+from .cloud_pipeline import CloudPagePipeline
 from .config import DetectorConfig
 from .llm_evaluation import LLMEvaluationConfig, evaluate_transcript
 from .pipeline import VideoPageDetector
@@ -28,7 +29,7 @@ from .mimo_asr import resolve_mimo_api_key
 
 
 APP_NAME = "课堂PPT智能处理"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 LOCAL_ASR_LABEL = "本地 faster-whisper"
 MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 VIDEO_FILE_TYPES = [
@@ -731,7 +732,10 @@ class DesktopApp:
         ).grid(row=1, column=1, sticky="w", pady=5)
         ttk.Label(
             asr_card,
-            text="云端更快；本地模式不上传课堂音频",
+            text=(
+                "完整处理时，每确认一页就立即启动云端转写，"
+                "转写完成后立即评分；本地模式不上传课堂音频"
+            ),
             style="Help.TLabel",
             wraplength=270,
             justify="left",
@@ -1292,9 +1296,51 @@ class DesktopApp:
 
     def _run_worker(self, mode: str, kwargs: dict[str, Any]) -> None:
         artifacts: dict[str, Any] = {}
+        cloud_pipeline: CloudPagePipeline | None = None
         try:
             paths: WorkflowPaths = kwargs["paths"]
             video: Path | None = kwargs.get("video")
+            transcription_config: TranscriptionConfig | None = kwargs.get(
+                "transcription_config"
+            )
+            streaming_cloud = (
+                mode == "full"
+                and transcription_config is not None
+                and transcription_config.engine == "mimo-cloud"
+            )
+            if streaming_cloud:
+                if video is None:
+                    raise ValueError("完整云端流水线缺少视频文件。")
+                llm_config: LLMEvaluationConfig | None = None
+                llm_api_key: str | None = None
+                if kwargs.get("llm_inputs") is not None:
+                    llm_config, llm_api_key = kwargs["llm_inputs"]
+
+                def pipeline_progress(
+                    stage: str,
+                    message: str,
+                    completed: int,
+                    total: int,
+                ) -> None:
+                    ratio = completed / max(total, 1)
+                    if stage == "LLM关联度评分":
+                        progress = 55 + ratio * 40
+                    else:
+                        progress = 30 + ratio * (
+                            45 if llm_config is not None else 65
+                        )
+                    self._put_progress(stage, message, progress)
+
+                cloud_pipeline = CloudPagePipeline(
+                    video_path=video,
+                    result_path=paths.result_json,
+                    output_dir=paths.run_dir,
+                    transcription_config=transcription_config,
+                    asr_api_key=kwargs.get("asr_api_key") or "",
+                    llm_config=llm_config,
+                    llm_api_key=llm_api_key,
+                    progress_callback=pipeline_progress,
+                )
             if mode in {"full", "detect"}:
                 self._put_progress("PPT页面识别", "正在分析视频页面", 1)
                 detector = VideoPageDetector(kwargs["detector_config"])
@@ -1305,7 +1351,19 @@ class DesktopApp:
                     progress_callback=lambda message, value: self._put_progress(
                         "PPT页面识别",
                         message,
-                        (float(value or 0) * (30 if mode == "full" else 100)),
+                        (
+                            float(value or 0)
+                            * (
+                                60
+                                if mode == "full" and streaming_cloud
+                                else (30 if mode == "full" else 100)
+                            )
+                        ),
+                    ),
+                    page_ready_callback=(
+                        cloud_pipeline.submit_page
+                        if cloud_pipeline is not None
+                        else None
                     ),
                 )
                 artifacts["detection"] = detection
@@ -1313,7 +1371,18 @@ class DesktopApp:
                 artifacts["detection"] = self._read_json(
                     Path(kwargs["result_path"])
                 )
-            if mode in {"full", "transcribe"}:
+            if cloud_pipeline is not None:
+                self._put_progress(
+                    "云端流水线",
+                    "PPT检测完成，正在等待剩余页面转写与评分",
+                    60,
+                )
+                transcript, evaluation = cloud_pipeline.finish(detection)
+                artifacts["transcript"] = transcript
+                if evaluation is not None:
+                    artifacts["evaluation"] = evaluation
+                cloud_pipeline = None
+            elif mode in {"full", "transcribe"}:
                 result_path = (
                     paths.result_json
                     if mode == "full"
@@ -1337,7 +1406,11 @@ class DesktopApp:
             if mode == "evaluate":
                 transcript_path = Path(kwargs["transcript_path"])
                 artifacts["transcript"] = self._read_json(transcript_path)
-            if mode == "full" and kwargs.get("llm_inputs") is not None:
+            if (
+                mode == "full"
+                and not streaming_cloud
+                and kwargs.get("llm_inputs") is not None
+            ):
                 llm_config, api_key = kwargs["llm_inputs"]
                 evaluation = evaluate_transcript(
                     paths.transcript_json,
@@ -1371,6 +1444,8 @@ class DesktopApp:
                 artifacts["evaluation"] = evaluation
             self.events.put(("complete", mode, paths, artifacts))
         except Exception as exc:
+            if cloud_pipeline is not None:
+                cloud_pipeline.abort()
             self.events.put(
                 ("error", str(exc), traceback.format_exc())
             )
@@ -1409,7 +1484,12 @@ class DesktopApp:
                     _, stage, message, progress = event
                     self.stage_var.set(str(stage))
                     self.status_var.set(str(message))
-                    self.progress_var.set(float(progress))
+                    self.progress_var.set(
+                        max(
+                            float(self.progress_var.get()),
+                            float(progress),
+                        )
+                    )
                     self._append_log(str(message))
                 elif kind == "complete":
                     _, mode, paths, artifacts = event
