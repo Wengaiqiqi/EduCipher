@@ -1,0 +1,21 @@
+{
+  "engine": "faster-whisper",
+  "model": "small",
+  "language": "zh",
+  "device": "cpu",
+  "compute_type": "int8",
+  "beam_size": 1,
+  "vad_filter": true,
+  "model_download_root": "models/faster-whisper",
+  "initial_prompt": "以下是中文大学物理课堂录音，请使用简体中文准确转写专业术语。",
+  "hotwords": "刚体 转动惯量 转动定律 角动量 角动量守恒 动能定理 质点",
+  "mimo_base_url": "https://api.xiaomimimo.com/v1",
+  "mimo_model": "mimo-v2.5-asr",
+  "mimo_api_key_env": "MIMO_API_KEY",
+  "mimo_language": "auto",
+  "mimo_max_concurrency": 3,
+  "mimo_max_chunk_duration_sec": 90.0,
+  "mimo_timeout_sec": 180.0,
+  "mimo_max_retries": 3,
+  "ffmpeg_path": null
+}

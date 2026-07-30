@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-page-detector"
+version = "1.4.0"
+description = "Offline PPT page-change detector for classroom recordings"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10.0",
+  "faster-whisper>=1.2.1,<2",
+  "httpx>=0.27,<1",
+]
+
+[project.scripts]
+video-page-detector = "video_page_detector.cli:main"
+video-page-detector-gui = "video_page_detector.gui:main"
+classroom-ppt-processor = "video_page_detector.desktop_app:main"
+legacy-ffmpeg-scene-detector = "legacy_ffmpeg_scene_detector.cli:main"
+legacy-ffmpeg-scene-detector-gui = "legacy_ffmpeg_scene_detector.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["video_page_detector*", "legacy_ffmpeg_scene_detector*"]
+
+[tool.setuptools.package-data]
+legacy_ffmpeg_scene_detector = ["config/*.json"]
