@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -75,9 +76,23 @@ class TimedCloudPagePipeline(CloudPagePipeline):
 
 
 def main() -> int:
-    video = Path(r"E:\leeson\test_vedio\444.mp4")
-    output_root = PROJECT_ROOT / "diagnostics" / "streaming_temporal_fullchain_444"
-    video_id = "444_streaming_temporal_fullchain"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "video",
+        nargs="?",
+        type=Path,
+        default=Path(r"E:\leeson\test_vedio\444.mp4"),
+    )
+    parser.add_argument("--label")
+    args = parser.parse_args()
+    video = args.video.resolve()
+    label = args.label or video.stem
+    output_root = (
+        PROJECT_ROOT
+        / "diagnostics"
+        / f"streaming_temporal_fullchain_{label}"
+    )
+    video_id = f"{label}_streaming_temporal_fullchain"
     run_dir = output_root / video_id
     started = time.perf_counter()
 
