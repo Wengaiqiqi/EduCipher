@@ -1889,8 +1889,8 @@ select:focus-visible {
   font-size: 14px;
 }
 .report-viewer-page-body {
-  display: grid;
-  grid-template-columns: minmax(320px, 1.25fr) minmax(280px, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: 16px;
   padding: 16px;
 }
@@ -1962,6 +1962,27 @@ select:focus-visible {
   color: var(--muted);
   line-height: 1.7;
   white-space: pre-wrap;
+}
+.report-viewer-footer {
+  border-top: 1px solid var(--border);
+  padding: 14px 22px;
+}
+.report-viewer-footer .toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.report-viewer-footer .toggle-row small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.evidence-content {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
 }
 
 .light .report-viewer-summary article,

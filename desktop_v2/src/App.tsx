@@ -245,9 +245,11 @@ function PageCard({
   );
 }
 
-function ReportViewer({ task, onClose }: { task: TaskRecord; onClose: () => void }) {
+function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: () => void; settings?: AppSettings }) {
   const score = Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0);
   const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
+  const [showEvidence, setShowEvidence] = useState(false);
+  const includeEvidence = settings?.include_evidence ?? false;
   return (
     <div className="modal-backdrop report-viewer-backdrop">
       <div className="modal report-viewer-modal">
@@ -277,20 +279,38 @@ function ReportViewer({ task, onClose }: { task: TaskRecord; onClose: () => void
                 </div>
                 <div className="report-viewer-page-score"><i style={{ width: `${page.score || 0}%` }} /></div>
                 <div className="report-viewer-page-body">
-                  <div className="report-viewer-shot"><SlideImage page={page} /></div>
+                  <div className="report-viewer-shot">
+                    <SlideImage page={page} key={"r" + page.page_id + (page.screenshot_path || "")} />
+                  </div>
                   <div className="report-viewer-text">
-                    <h4>时间戳</h4>
-                    <p>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</p>
                     <h4>原始转录</h4>
                     <p>{text || "暂无语音识别内容。"}</p>
                     <h4>评分理由</h4>
                     <p>{reason || "暂无评分理由。"}</p>
+                    {includeEvidence && showEvidence && (
+                      <div className="evidence-content">
+                        <h4>对应证据</h4>
+                        <p>{reason || `当前任务没有生成详细对应证据，需要在设置中打开「返回详细对应证据」后重新评分。`}</p>
+                      </div>
+                    )}
                   </div>
                 </div>
               </section>
             );
           })}
         </div>
+        {includeEvidence && (
+          <div className="report-viewer-footer">
+            <label className="toggle-row">
+              <span>
+                显示对应证据
+                <small>打开后显示 PPT 与讲话的对应内容</small>
+              </span>
+              <input type="checkbox" checked={showEvidence} onChange={(e) => setShowEvidence(e.target.checked)} />
+              <i />
+            </label>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -919,7 +939,7 @@ export default function App() {
         <div><Activity size={16} className="pulse" /><span>{activeTask?.status === "running" ? "服务活动中" : "服务待命"}</span></div>
       </footer>
 
-      {reportTask && <ReportViewer task={reportTask} onClose={() => setReportTask(null)} />}
+      {reportTask && <ReportViewer task={reportTask} settings={settings} onClose={() => setReportTask(null)} />}
       {showSettings && <SettingsModal settings={settings} onSave={saveSettings} onClose={() => setShowSettings(false)} />}
       {showNewTask && <NewTaskModal settings={settings} onStart={startTask} onClose={() => setShowNewTask(false)} />}
     </div>
