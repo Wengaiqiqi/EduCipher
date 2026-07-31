@@ -64,6 +64,32 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def run_metadata_path(run_dir: Path) -> Path:
+    return run_dir / "run_metadata.json"
+
+
+def write_run_metadata(run_dir: Path, started_at: float) -> None:
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_metadata_path(run_dir).write_text(
+            json.dumps({"started_at": started_at}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def load_run_elapsed(run_dir: Path) -> float | None:
+    try:
+        data = json.loads(run_metadata_path(run_dir).read_text(encoding="utf-8"))
+        started_at = float(data.get("started_at"))
+        elapsed = time.time() - started_at
+        return round(max(elapsed, 0.0), 3)
+    except Exception:
+        return None
+
+
+
 def page_speech_text(page: Mapping[str, Any]) -> str:
     explicit = str(page.get("speech_text") or "").strip()
     if explicit:
@@ -76,6 +102,17 @@ def page_speech_text(page: Mapping[str, Any]) -> str:
         for item in utterances
         if isinstance(item, Mapping) and str(item.get("text") or "").strip()
     )
+
+
+def resolve_screenshot_path(page: Mapping[str, Any], run_dir: Path) -> str:
+    """Resolve screenshot_path to an absolute Windows path string suitable for convertFileSrc."""
+    raw = str(page.get("screenshot_path") or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return str(candidate.resolve())
+    return str((run_dir / candidate.name).resolve())
 
 
 def load_task(run_dir: Path) -> dict[str, Any] | None:
@@ -92,14 +129,21 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             continue
         page_id = int(page["page_id"])
         page_map[page_id] = {**dict(page), "status": "detected"}
+        row = page_map[page_id]
+        row["screenshot_path"] = resolve_screenshot_path(page, run_dir)
     if transcript:
         for page in transcript.get("pages", []):
             if not isinstance(page, Mapping) or "page_id" not in page:
                 continue
             page_id = int(page["page_id"])
             row = page_map.setdefault(page_id, {"page_id": page_id})
+            # preserve resolved screenshot_path from detection
+            existing_screenshot = row.get("screenshot_path", "")
+            existing_speech = row.get("speech_text", "")
             row.update(dict(page))
-            row["speech_text"] = page_speech_text(page)
+            if existing_screenshot:
+                row["screenshot_path"] = existing_screenshot
+            row["speech_text"] = existing_speech or page_speech_text(page)
             row["status"] = "detected"
     if evaluation:
         for page in evaluation.get("pages", []):
@@ -107,7 +151,11 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
                 continue
             page_id = int(page["page_id"])
             row = page_map.setdefault(page_id, {"page_id": page_id})
-            row.update(dict(page))
+            # evaluation dict lacks screenshot_path/speech_text, so preserve existing
+            for key, value in page.items():
+                if key in {"screenshot_path", "speech_text"}:
+                    continue
+                row[key] = value
             row["status"] = (
                 "failed" if page.get("status") == "failed" else "completed"
             )
@@ -115,7 +163,9 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         updated_at = (run_dir / "result.json").stat().st_mtime * 1000
     except OSError:
         updated_at = 0
+    elapsed = load_run_elapsed(run_dir)
     return {
+
         "id": str(run_dir.resolve()),
         "video_id": str(detection.get("video_id") or run_dir.name),
         "video_path": str(detection.get("video_path") or ""),
@@ -128,6 +178,7 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             if evaluation
             else ("等待关联度评分" if transcript else "PPT页面识别完成")
         ),
+        "elapsed_sec": elapsed,
         "model": str(evaluation.get("model") or "") if evaluation else "",
         "summary": (
             evaluation.get("summary", {})
@@ -289,6 +340,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             algorithm_version="1.4.0",
             streaming_page_confirmation=True,
         )
+        write_run_metadata(run_dir, time.time())
         detector = VideoPageDetector(default_detector_config(settings))
         emit("worker.log", message=f"检测器已初始化，ffmpeg={default_detector_config(settings).ffmpeg_path}，准备分析视频 {video_id}")
         include_llm = bool(settings.get("include_llm", True)) and mode == "full"
@@ -335,6 +387,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     stage=stage,
                     message=message,
                     progress=progress,
+                    stage_progress=round(ratio * 100),
                     completed=completed,
                     total=total,
                 )
@@ -378,6 +431,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 message=message,
                 progress=float(progress or 0)
                 * (58 if mode == "full" else 100),
+                stage_progress=round(float(progress or 0) * 100),
             )
 
         def page_ready(page: dict[str, Any], completed: int, total: int) -> None:
@@ -390,6 +444,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 stage="PPT页面识别",
                 message=f"第{page['page_id']}页高清截图已确认",
                 progress=30 + completed / max(total, 1) * 28,
+                stage_progress=round(completed / max(total, 1) * 100),
                 completed=completed,
                 total=total,
             )
@@ -427,6 +482,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     stage="语音转写",
                     message=message,
                     progress=30 + float(progress or 0) * 45,
+                    stage_progress=round(float(progress or 0) * 100),
                 ),
             )
             for page in transcript.get("pages", []):
@@ -447,6 +503,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                         stage="LLM关联度评分",
                         message=f"{completed}/{total}：{message}",
                         progress=75 + completed / max(total, 1) * 25,
+                        stage_progress=round(completed / max(total, 1) * 100),
                     ),
                 )
                 evaluation_by_id = {
