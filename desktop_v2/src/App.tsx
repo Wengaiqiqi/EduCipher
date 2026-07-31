@@ -3,7 +3,6 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
 import {
   Activity,
   BarChart3,
@@ -23,6 +22,7 @@ import {
   Menu,
   MessageSquareText,
   Minus,
+  Moon,
   PanelLeftClose,
   Play,
   Plus,
@@ -31,6 +31,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Square,
+  Sun,
   Timer,
   Video,
   WandSparkles,
@@ -105,6 +106,10 @@ function pageImage(page?: PageRecord) {
   return page?.screenshot_path ? convertFileSrc(page.screenshot_path) : "";
 }
 
+function overallScore(task?: TaskRecord) {
+  return Number(task?.summary?.strict_overall_score ?? task?.summary?.association_average_score ?? 0);
+}
+
 function EmptySlide({ compact = false }: { compact?: boolean }) {
   return (
     <div className={`empty-slide ${compact ? "compact" : ""}`}>
@@ -139,53 +144,52 @@ function SlideImage({
 
 function StagePipeline({ task }: { task?: TaskRecord }) {
   const stage = task?.stage || "";
-  const progress = task?.progress || 0;
+  const pages = task?.pages || [];
   const isRunning = task?.status === "running";
-  const isComplete = progress >= 100;
-  const stages = [
-    { label: "PPT识别", lo: 0, hi: 58 },
-    { label: "语音识别", lo: 58, hi: 78 },
-    { label: "关联度评分", lo: 78, hi: 100 },
-    { label: "生成报告", lo: 100, hi: 100 },
-  ];
-  let activeIndex = isComplete ? 3 : 0;
-  if (stage.includes("语音") || stage.includes("云端") || (progress >= 58 && progress < 78)) activeIndex = 1;
-  if (stage.includes("LLM") || stage.includes("评分") || (progress >= 78 && progress < 100)) activeIndex = 2;
-  if (stage.includes("报告")) activeIndex = 3;
+  const isComplete = (task?.progress || 0) >= 100;
 
-  function stagePercent(index: number): number {
-    if (!isRunning && !isComplete) return 0;
-    if (isComplete) return 100;
-    const stageInfo = stages[index];
-    if (index < activeIndex) return 100;
-    if (index === activeIndex) {
-      if (stageInfo.hi <= stageInfo.lo) return 100;
-      return Math.max(0, Math.min(100, Math.round((progress - stageInfo.lo) / (stageInfo.hi - stageInfo.lo) * 100)));
-    }
-    return 0;
-  }
+  // Pages in each processing state — streaming mode runs stages in parallel
+  const detected = pages.filter((p) => p.status !== "waiting").length;
+  const transcribed = pages.filter((p) => p.status === "scoring" || p.status === "completed").length;
+  const scored = pages.filter((p) => p.status === "completed" && p.score != null).length;
+
+  const totalPages = Math.max(pages.length, 1);
+  const pptPct = Math.round((detected / totalPages) * 100);
+  const voicePct = pages.length ? Math.round((transcribed / totalPages) * 100) : 0;
+  const llmPct = pages.length ? Math.round((scored / totalPages) * 100) : 0;
+  const stageRatio = task?.status === "completed"
+    ? 100
+    : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
+
+  // Each stage independently active/done based on Worker stage and page data
+  const pptActive = isRunning && (stage.includes("PPT") || stage.includes("页面") || detected === 0);
+  const pptDone = detected > 0 && !pptActive;
+  const voiceActive = isRunning && (stage.includes("语音") || stage.includes("转写") || stage.includes("云端"));
+  const voiceDone = transcribed > 0 && transcribed >= detected && !voiceActive;
+  const llmActive = isRunning && (stage.includes("LLM") || stage.includes("评分"));
+  const llmDone = scored > 0 && scored >= transcribed && !llmActive;
+
+  const stages = [
+    { label: "PPT识别",     active: pptActive,   done: pptDone || isComplete,   pct: pptPct },
+    { label: "语音识别",    active: voiceActive, done: voiceDone || isComplete, pct: voicePct },
+    { label: "关联度评分",  active: llmActive,   done: llmDone || isComplete,   pct: llmPct },
+    { label: "生成报告",    active: false,       done: isComplete,              pct: isComplete ? 100 : stageRatio },
+  ];
 
   return (
     <div className="stage-pipeline">
-      {stages.map(({ label }, index) => {
-        const done = isComplete || index < activeIndex;
-        const active = index === activeIndex && !isComplete;
-        const pct = stagePercent(index);
-        return (
-          <div className="stage-wrap" key={label}>
-            <div className={`stage-node ${done ? "done" : ""} ${active ? "active" : ""}`}>
-              <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
-              <div>
-                <strong>{label}</strong>
-                <small>{done ? "已完成" : active ? `进行中 ${pct}%` : "等待中"}</small>
-              </div>
+      {stages.map(({ label, active, done, pct }) => (
+        <div className="stage-wrap" key={label}>
+          <div className={`stage-node ${done ? "done" : ""} ${active ? "active" : ""}`}>
+            <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
+            <div>
+              <strong>{label}</strong>
+              <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : isRunning ? " · 等待中" : ""}</small>
             </div>
-            {index < stages.length - 1 && (
-              <div className={`stage-link ${done ? "done" : ""}`} />
-            )}
           </div>
-        );
-      })}
+          {label !== "生成报告" && <div className={`stage-link ${done ? "done" : ""}`} />}
+        </div>
+      ))}
     </div>
   );
 }
@@ -212,21 +216,12 @@ function PageCard({
           </span>
         </div>
         <p>
-          {page.speech_text?.trim() ||
-            (page.status === "transcribing"
+          {page.speech_text?.trim()
+            ? page.speech_text.trim().slice(0, 120) + (page.speech_text.trim().length > 120 ? "…" : "")
+            : (page.status === "transcribing"
               ? "正在将本页时间范围内的课堂语音转换成文字…"
               : "本页暂时没有可显示的课堂转写内容。")}
         </p>
-        <div className="keyword-row">
-          {page.speech_text
-            ? page.speech_text
-                .replace(/[，。、“”：；！？]/g, " ")
-                .split(/\s+/)
-                .filter((word) => word.length >= 2)
-                .slice(0, 5)
-                .map((word) => <span key={word}>{word.slice(0, 8)}</span>)
-            : ["页面截图", "时间范围"].map((word) => <span key={word}>{word}</span>)}
-        </div>
       </div>
       <div className="page-status-column">
         <span className={`status-chip ${page.status || "waiting"}`}>
@@ -236,7 +231,6 @@ function PageCard({
         {page.score != null ? (
           <div className="score-badge">
             <strong>{Math.round(page.score)}</strong>
-            <span>分</span>
           </div>
         ) : page.status === "scoring" ? (
           <div className="score-progress">
@@ -251,21 +245,66 @@ function PageCard({
   );
 }
 
+function ReportViewer({ task, onClose }: { task: TaskRecord; onClose: () => void }) {
+  const score = Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0);
+  const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
+  return (
+    <div className="modal-backdrop report-viewer-backdrop">
+      <div className="modal report-viewer-modal">
+        <div className="modal-header">
+          <div>
+            <h2>{task.video_id} — 分析报告</h2>
+            <p>总关联度、逐页评分、PPT 截图、语音转录和评分理由都在这里汇总。</p>
+          </div>
+          <button className="icon-button" onClick={onClose}><X size={19} /></button>
+        </div>
+        <div className="report-viewer-summary">
+          <article><Gauge /><span>总关联度</span><strong>{Math.round(score) || "—"}</strong></article>
+          <article><History /><span>讲话覆盖率</span><strong>{Math.round(coverage)}%</strong></article>
+          <article><CheckCircle2 /><span>已完成页</span><strong>{task.pages.filter((p) => p.status === "completed").length}</strong></article>
+          <article><FileText /><span>总页数</span><strong>{task.pages.length}</strong></article>
+        </div>
+        <div className="report-viewer-list">
+          {task.pages.map((page) => {
+            const text = page.speech_text?.trim() || "";
+            const reason = page.reason || "";
+            return (
+              <section className="report-viewer-page" key={page.page_id}>
+                <div className="report-viewer-page-head">
+                  <strong>第 {page.page_id} 页</strong>
+                  <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
+                  {page.score != null && <b>{Math.round(page.score)}分</b>}
+                </div>
+                <div className="report-viewer-page-score"><i style={{ width: `${page.score || 0}%` }} /></div>
+                <div className="report-viewer-page-body">
+                  <div className="report-viewer-shot"><SlideImage page={page} /></div>
+                  <div className="report-viewer-text">
+                    <h4>时间戳</h4>
+                    <p>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</p>
+                    <h4>原始转录</h4>
+                    <p>{text || "暂无语音识别内容。"}</p>
+                    <h4>评分理由</h4>
+                    <p>{reason || "暂无评分理由。"}</p>
+                  </div>
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
 function Inspector({
   page,
-  onOpenResult,
 }: {
   page?: PageRecord;
-  onOpenResult: () => void;
 }) {
   const [showEvidence, setShowEvidence] = useState(false);
   return (
     <aside className="inspector">
       <div className="inspector-header">
         <h2>{page ? `第 ${page.page_id} 页详情` : "页面详情"}</h2>
-        <button className="icon-button" title="打开结果目录" onClick={onOpenResult}>
-          <FolderOpen size={17} />
-        </button>
       </div>
       <div className="inspector-scroll">
         <div className="large-preview">
@@ -369,29 +408,28 @@ function SettingsModal({
             <label>
               识别方式
               <select value={draft.asr_engine} onChange={(e) => update("asr_engine", e.target.value as AppSettings["asr_engine"])}>
-                <option value="mimo-cloud">小米 MiMo 云端（推荐）</option>
                 <option value="faster-whisper">本地 faster-whisper</option>
+                <option value="mimo-cloud">ASR 模型服务（OpenAI 兼容）</option>
               </select>
             </label>
-            {draft.asr_engine === "mimo-cloud" ? (
-              <>
-                <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
-                <label>服务地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
-                <label>ASR 并发数<input type="number" min={1} max={5} value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))} /></label>
-              </>
-            ) : (
+            {draft.asr_engine === "faster-whisper" ? (
               <label>本地模型<input value={draft.asr_model} onChange={(e) => update("asr_model", e.target.value)} /></label>
+            ) : (
+              <div className="form-two-columns">
+                <label className="wide-field">ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
+                <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
+                <label>并发上限<input type="number" min={1} max={10} value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))} /></label>
+              </div>
             )}
           </section>
           <section className="wide">
             <h3><WandSparkles size={17} /> LLM 关联度评分</h3>
-            <div className="form-two-columns">
+            <div className="form-two-columns aligned-fields">
               <label>模型名称<input value={draft.llm_model} onChange={(e) => update("llm_model", e.target.value)} /></label>
               <label>并发上限<input type="number" min={1} max={10} value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))} /></label>
               <label className="wide-field">OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} /></label>
             </div>
             <div className="inline-options">
-              <label className="check-label"><input type="checkbox" checked={draft.include_llm} onChange={(e) => update("include_llm", e.target.checked)} /> 完成转写后自动评分</label>
               <label className="check-label"><input type="checkbox" checked={draft.include_evidence} onChange={(e) => update("include_evidence", e.target.checked)} /> 返回详细对应证据</label>
             </div>
           </section>
@@ -420,8 +458,8 @@ function NewTaskModal({
   const [mode, setMode] = useState<"full" | "detect">("full");
   const [asrKey, setAsrKey] = useState("");
   const [llmKey, setLlmKey] = useState("");
-  const [asrConsent, setAsrConsent] = useState(false);
-  const [llmConsent, setLlmConsent] = useState(false);
+  const [asrConsent, setAsrConsent] = useState(true);
+  const [llmConsent, setLlmConsent] = useState(true);
   const [error, setError] = useState("");
 
   async function chooseVideo() {
@@ -444,14 +482,6 @@ function NewTaskModal({
   async function submit() {
     if (!videoPath || !outputRoot || !videoId.trim()) {
       setError("请选择视频、结果目录并填写任务名称。");
-      return;
-    }
-    if (mode === "full" && settings.asr_engine === "mimo-cloud" && !asrConsent) {
-      setError("请确认允许把临时音频发送给小米 MiMo。");
-      return;
-    }
-    if (mode === "full" && settings.include_llm && !llmConsent) {
-      setError("请确认允许发送 PPT 截图和课堂转写用于评分。");
       return;
     }
     await onStart({
@@ -511,18 +541,8 @@ function NewTaskModal({
                 <strong>云端服务授权</strong>
                 <span>密钥只在本次任务的内存中使用，不写入设置。</span>
               </div>
-              {settings.asr_engine === "mimo-cloud" && (
-                <label>MiMo API Key（已设置环境变量可留空）<input type="password" value={asrKey} onChange={(e) => setAsrKey(e.target.value)} placeholder="sk-••••••••" /></label>
-              )}
-              {settings.include_llm && (
-                <label>LLM API Key（已设置环境变量可留空）<input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} placeholder="sk-••••••••" /></label>
-              )}
-              {settings.asr_engine === "mimo-cloud" && (
-                <label className="check-label"><input type="checkbox" checked={asrConsent} onChange={(e) => setAsrConsent(e.target.checked)} /> 允许发送按 PPT 时间切分的临时音频到小米 MiMo</label>
-              )}
-              {settings.include_llm && (
-                <label className="check-label"><input type="checkbox" checked={llmConsent} onChange={(e) => setLlmConsent(e.target.checked)} /> 允许发送 PPT 截图与对应课堂文字到 LLM</label>
-              )}
+              <label>MiMo API Key（已设置环境变量可留空）<input type="password" value={asrKey} onChange={(e) => setAsrKey(e.target.value)} placeholder="sk-••••••••" /></label>
+              <label>LLM API Key（已设置环境变量可留空）<input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} placeholder="sk-••••••••" /></label>
             </div>
           )}
           {error && <div className="form-error"><XCircle size={16} />{error}</div>}
@@ -536,10 +556,10 @@ function NewTaskModal({
   );
 }
 
-function ReportsView({ tasks }: { tasks: TaskRecord[] }) {
+function ReportsView({ tasks, onOpenReport }: { tasks: TaskRecord[]; onOpenReport: (task: TaskRecord) => void }) {
   const completed = tasks.filter((task) => task.status === "completed");
   const scores = completed
-    .map((task) => Number(task.summary?.strict_average_score ?? task.summary?.average_score))
+    .map((task) => Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0))
     .filter(Number.isFinite);
   const average = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
   return (
@@ -558,8 +578,8 @@ function ReportsView({ tasks }: { tasks: TaskRecord[] }) {
           <div className="report-row" key={task.id}>
             <div className="report-icon"><FileText size={20} /></div>
             <div><strong>{task.video_id}</strong><span>{task.pages.length} 页 PPT · {task.model || "关联度模型"}</span></div>
-            <div className="report-score">{Math.round(Number(task.summary?.strict_average_score ?? task.summary?.average_score ?? 0))}<small>分</small></div>
-            <button className="button secondary" onClick={() => openPath(task.run_dir)}>打开报告</button>
+            <div className="report-score">{Math.round(overallScore(task) || 0)}<small>分</small></div>
+            <button className="button secondary" onClick={() => onOpenReport(task)}>打开报告</button>
           </div>
         ))}
         {!completed.length && <div className="empty-report">完成一次完整处理后，报告会显示在这里。</div>}
@@ -576,6 +596,7 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [reportTask, setReportTask] = useState<TaskRecord | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [cloudActive, setCloudActive] = useState(0);
   const [error, setError] = useState("");
@@ -583,6 +604,9 @@ export default function App() {
   const [workerStatus, setWorkerStatus] = useState<"starting" | "ready" | "failed">("starting");
   const [algorithmVersion, setAlgorithmVersion] = useState("");
   const [workerLogs, setWorkerLogs] = useState<string[]>([]);
+  const [theme, setTheme] = useState<"dark" | "light">(
+    () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "dark",
+  );
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
@@ -670,7 +694,7 @@ export default function App() {
         setTasks((current) =>
           current.map((task) =>
             task.id === (data.task_id || activeTaskId)
-              ? { ...task, status: "running", progress: data.progress, stage: data.stage, message: data.message }
+              ? { ...task, status: "running", progress: data.progress, stage: data.stage, stage_progress: data.stage_progress, message: data.message }
               : task,
           ),
         );
@@ -741,7 +765,7 @@ export default function App() {
   const recentTasks = useMemo(() => tasks.filter((t) => t.pages.length > 0 || t.status === "running").slice(0, 8), [tasks]);
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${theme}`}>
       <header className="titlebar">
         <div className="brand" data-tauri-drag-region>
           <div className="brand-mark"><span /><span /></div>
@@ -761,6 +785,9 @@ export default function App() {
               : "正在连接处理引擎"}
         </div>
         <div className="window-actions">
+          <button onClick={() => { const t = theme === "dark" ? "light" : "dark"; setTheme(t); localStorage.setItem("kexi.theme", t); }} title="切换主题">
+            {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+          </button>
           <button onClick={() => getCurrentWindow().minimize()}><Minus size={17} /></button>
           <button onClick={() => getCurrentWindow().toggleMaximize()}><Square size={13} /></button>
           <button className="close" onClick={() => getCurrentWindow().close()}><X size={18} /></button>
@@ -790,7 +817,15 @@ export default function App() {
               <div className="recent-thumb">
                 {task.pages[0] ? <SlideImage page={task.pages[0]} compact /> : <ImageIcon size={18} />}
               </div>
-              <div><strong>{task.video_id}</strong><span>{task.status === "running" ? "正在处理" : `${task.pages.length} 页 PPT`}</span></div>
+              <div>
+                <strong>{task.video_id}</strong>
+                <span>
+                  {task.status === "running" ? "正在处理" : `${task.pages.length} 页`}
+                  {task.elapsed_sec != null && task.elapsed_sec > 0
+                    ? ` · ${formatTime(task.elapsed_sec)}`
+                    : ""}
+                </span>
+              </div>
               {task.status === "running" && <i className="task-dot" />}
             </button>
           ))}
@@ -802,7 +837,7 @@ export default function App() {
       </aside>
 
       {nav === "reports" ? (
-        <ReportsView tasks={tasks} />
+        <ReportsView tasks={tasks} onOpenReport={(t) => setReportTask(t)} />
       ) : (
         <>
           <main className="workspace">
@@ -816,9 +851,18 @@ export default function App() {
                   <span>处理中</span>
                   <strong>{completedPages}</strong>
                   <span>/ {activeTask.pages.length || "—"} 页</span>
+                  {activeTask.summary?.strict_overall_score != null && (
+                    <><i /><Gauge size={16} /><strong>{Math.round(activeTask.summary.strict_overall_score)}</strong><span>总关联度</span></>
+                  )}
+                  {activeTask.summary?.association_average_score != null && (
+                    <><i /><strong>{Math.round(activeTask.summary.association_average_score)}</strong><span>平均分</span></>
+                  )}
+                  {activeTask.summary?.speech_page_coverage_percent != null && (
+                    <><i /><strong>{Math.round(activeTask.summary.speech_page_coverage_percent)}%</strong><span>覆盖率</span></>
+                  )}
                   <i />
                   <Timer size={17} />
-                  <span>{formatTime(elapsed || activeTask.elapsed_sec)}</span>
+                  <span>{formatTime(elapsed || activeTask.elapsed_sec || 0)}</span>
                 </div>
               )}
               <StagePipeline task={activeTask} />
@@ -840,7 +884,6 @@ export default function App() {
                     <Activity size={16} />
                     <span>{activeTask.message || activeTask.stage || "已加载历史处理结果"}</span>
                   </div>
-                  <button onClick={() => openPath(activeTask.run_dir)}><FolderOpen size={15} />结果目录</button>
                 </div>
                 {error && <div className="task-error"><XCircle size={17} /><span>{error}</span><button onClick={() => setError("")}>关闭</button></div>}
                 <div className="page-list">
@@ -863,7 +906,7 @@ export default function App() {
               </section>
             )}
           </main>
-          <Inspector page={selectedPage} onOpenResult={() => activeTask?.run_dir && openPath(activeTask.run_dir)} />
+          <Inspector page={selectedPage} />
         </>
       )}
 
@@ -876,6 +919,7 @@ export default function App() {
         <div><Activity size={16} className="pulse" /><span>{activeTask?.status === "running" ? "服务活动中" : "服务待命"}</span></div>
       </footer>
 
+      {reportTask && <ReportViewer task={reportTask} onClose={() => setReportTask(null)} />}
       {showSettings && <SettingsModal settings={settings} onSave={saveSettings} onClose={() => setShowSettings(false)} />}
       {showNewTask && <NewTaskModal settings={settings} onStart={startTask} onClose={() => setShowNewTask(false)} />}
     </div>

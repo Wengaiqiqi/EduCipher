@@ -4,6 +4,7 @@ version = "2.0.0"
 description = "课析 - 课堂视频与 PPT 智能分析桌面端"
 authors = ["Kexi"]
 edition = "2021"
+build = "build.rs"
 
 [lib]
 name = "kexi_desktop_lib"

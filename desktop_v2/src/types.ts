@@ -28,12 +28,14 @@ export interface TaskRecord {
   status: "idle" | "running" | "completed" | "failed";
   progress?: number;
   stage?: string;
+  stage_progress?: number;
   message?: string;
   elapsed_sec?: number;
   model?: string;
   summary?: {
-    strict_average_score?: number;
-    average_score?: number;
+    strict_overall_score?: number;
+    association_average_score?: number;
+    speech_page_coverage_percent?: number;
     total_pages?: number;
     scored_pages?: number;
   };
@@ -73,6 +75,7 @@ export interface WorkerEvent {
   stage?: string;
   message?: string;
   progress?: number;
+  stage_progress?: number;
   page?: PageRecord;
   pages?: PageRecord[];
   result?: TaskRecord;

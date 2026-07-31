@@ -690,25 +690,29 @@ select:focus-visible {
 }
 
 .score-badge {
-  width: 94px;
-  height: 63px;
+  width: 82px;
+  height: 82px;
   border: 2px solid rgba(89, 216, 149, 0.23);
-  border-radius: 10px;
+  border-radius: 14px;
   background: rgba(50, 131, 87, 0.08);
   display: flex;
+  flex-direction: column;
   justify-content: center;
-  align-items: baseline;
+  align-items: center;
+  text-align: center;
   color: var(--green);
 }
 
 .score-badge strong {
-  font-size: 30px;
-  font-weight: 600;
+  font-size: 28px;
+  font-weight: 650;
+  line-height: 1;
 }
 
 .score-badge span {
-  margin-left: 4px;
+  margin-left: 0;
   font-size: 11px;
+  line-height: 1;
 }
 
 .score-progress {
@@ -1583,3 +1587,412 @@ select:focus-visible {
     display: none;
   }
 }
+
+/* ── Light theme ── */
+.light {
+  --bg: #f3f4f6;
+  --panel: #ffffff;
+  --panel-2: #f0f1f4;
+  --panel-3: #e5e7eb;
+  --border: #d1d5db;
+  --border-soft: #e5e7eb;
+  --text: #111827;
+  --muted: #6b7280;
+  --faint: #9ca3af;
+  color: var(--text);
+  background: var(--bg);
+}
+.light .workspace,
+.light .reports-view { background: var(--bg); }
+.light .titlebar,
+.light .sidebar,
+.light .statusbar,
+.light .workspace-header,
+.light .report-list,
+.light .report-row,
+.light .report-metrics article,
+.light .page-card,
+.light .inspector,
+.light .large-preview,
+.light .stage-pipeline,
+.light .modal,
+.light .settings-grid section,
+.light .new-task-modal .task-form,
+.light .cloud-auth-card {
+  background: var(--panel);
+  border-color: var(--border-soft);
+}
+.light .modal-actions,
+.light .settings-grid section,
+.light .new-task-modal .task-form,
+.light .cloud-auth-card {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-soft);
+}
+.light .modal-actions {
+  border-top-color: var(--border-soft);
+}
+.light .modal-backdrop {
+  background: rgba(15, 23, 42, 0.25);
+  backdrop-filter: blur(4px);
+}
+.light .workspace-header,
+.light .report-list h2,
+.light .modal-header,
+.light .inspector-header,
+.light .stream-toolbar,
+.light .page-card,
+.light .report-row,
+.light .score-section,
+.light .reason-section,
+.light .settings-grid section,
+.light .cloud-auth-card,
+.light .progress-summary,
+.light .stage-pipeline,
+.light .statusbar,
+.light .collapse-button,
+.light .recent-header,
+.light .divider {
+  color: var(--text);
+}
+.light .heading > span,
+.light .reports-heading span,
+.light .reports-heading p,
+.light .stream-toolbar,
+.light .progress-summary,
+.light .statusbar,
+.light .recent-header,
+.light .task-form label,
+.light .settings-grid label,
+.light .cloud-auth-card span,
+.light .modal-header p,
+.light .page-card-title span,
+.light .page-card-body p,
+.light .keyword-row span,
+.light .time-range span,
+.light .reason-section p,
+.light .score-level,
+.light .score-scale,
+.light .empty-report,
+.light .processing-placeholder,
+.light .toggle-row > span,
+.light .toggle-row small {
+  color: var(--muted);
+}
+.light .sidebar nav button {
+  color: var(--text);
+  background: transparent;
+}
+.light .sidebar nav button:hover,
+.light .sidebar nav button.active {
+  background: #f1f5f9;
+  color: var(--blue);
+}
+.light .sidebar nav button.active {
+  box-shadow: inset 2px 0 var(--blue);
+}
+.light .new-task-button {
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.06), rgba(37, 99, 235, 0.02));
+  color: var(--blue);
+  border-color: rgba(37, 99, 235, 0.25);
+}
+.light .new-task-button:hover {
+  background: rgba(37, 99, 235, 0.12);
+}
+.light .project-switcher,
+.light .collapse-button,
+.light .recent-list button,
+.light .path-picker,
+.light .button.secondary,
+.light .icon-button {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+.light .project-switcher:hover,
+.light .collapse-button:hover,
+.light .recent-list button:hover,
+.light .path-picker:hover,
+.light .button.secondary:hover,
+.light .icon-button:hover {
+  background: #e8ebf0;
+}
+.light .settings-modal,
+.light .settings-modal section,
+.light .settings-modal .task-form,
+.light .cloud-auth-card {
+  background: var(--panel);
+  color: var(--text);
+}
+.light .settings-grid h3,
+.light .settings-grid label,
+.light .task-form label,
+.light .cloud-auth-card label,
+.light .modal-header p {
+  color: var(--muted);
+}
+.light .check-label {
+  color: var(--text) !important;
+}
+.light .check-label input {
+  accent-color: var(--blue);
+}
+.light .toggle-row > i {
+  background: var(--panel-2);
+}
+.light .toggle-row > i::after {
+  background: var(--faint);
+}
+.light .toggle-row input:checked + i {
+  background: var(--blue);
+}
+.light .toggle-row input:checked + i::after {
+  background: #fff;
+}
+.light .task-form input[type="number"],
+.light .settings-grid input[type="number"],
+.light .cloud-auth-card input[type="number"] {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+.light .task-form input,
+.light .task-form select,
+.light .settings-grid input,
+.light .settings-grid select,
+.light .cloud-auth-card input {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+.light .settings-grid .form-two-columns,
+.light .settings-grid .aligned-fields,
+.light .form-two-columns {
+  align-items: end;
+}
+.light .settings-grid label,
+.light .task-form label,
+.light .cloud-auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+}
+.light .settings-grid label > input,
+.light .settings-grid label > select,
+.light .task-form label > input,
+.light .task-form label > select,
+.light .cloud-auth-card label > input,
+.light .cloud-auth-card label > select {
+  margin-top: 0;
+}
+.light .score-badge {
+
+  background: #ecfdf5;
+  color: #059669;
+}
+.light .form-error,
+.light .task-error {
+  background: #fef2f2;
+  border-color: rgba(220, 38, 38, 0.25);
+  color: #dc2626;
+}
+.light .page-card.selected { box-shadow: 0 10px 28px rgba(37, 99, 235, 0.08); }
+.light .page-thumb,
+.light .large-preview,
+.light .empty-slide,
+.light .evidence-panel { background: var(--panel-2); }
+.light .empty-slide-title { color: #6d28d9; }
+.light .stage-node > span { border-color: #94a3b8; color: #64748b; }
+.light .stage-node.done > span { color: #fff; }
+.light .stage-link { background: #cbd5e1; }
+.light .score-line { background: #dbe4ee; }
+.light .report-score { color: var(--green); }
+.light .cloud-health,
+.light .window-actions button,
+.light .brand strong,
+.light .page-card-title strong,
+.light .report-metrics article strong,
+.light .score-overview > strong,
+.light .time-range strong { color: var(--text); }
+.light .button.primary { background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #fff; }
+.light .modal,
+.light .settings-grid section,
+.light .new-task-modal .task-form,
+.light .cloud-auth-card { box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08); }
+
+.report-viewer-backdrop {
+  align-items: stretch;
+  padding: 20px;
+}
+.report-viewer-modal {
+  width: min(1180px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+}
+.report-viewer-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  padding: 18px 22px 0;
+}
+.report-viewer-summary article {
+  min-height: 88px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+  display: grid;
+  gap: 6px;
+}
+.report-viewer-summary article svg {
+  color: var(--blue);
+}
+.report-viewer-summary article span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.report-viewer-summary article strong {
+  font-size: 26px;
+  font-weight: 650;
+}
+.report-viewer-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 22px 22px;
+  display: grid;
+  gap: 14px;
+}
+.report-viewer-page {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.report-viewer-page-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.report-viewer-page-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.report-viewer-page-head b {
+  color: var(--green);
+  font-size: 14px;
+}
+.report-viewer-page-body {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.25fr) minmax(280px, 1fr);
+  gap: 16px;
+  padding: 16px;
+}
+.report-viewer-page-score {
+  height: 4px;
+  background: var(--border-soft);
+  overflow: hidden;
+}
+.report-viewer-page-score i {
+  display: block;
+  height: 100%;
+  background: var(--green);
+}
+.report-viewer-page-head {
+  cursor: pointer;
+}
+.report-viewer-page-head:hover {
+  background: var(--panel-2);
+}
+.report-viewer-summary-collapsed {
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px 14px;
+  cursor: pointer;
+}
+.report-viewer-summary-collapsed:hover {
+  background: var(--panel-2);
+}
+.report-viewer-summary-row {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 10px;
+  align-items: start;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.report-viewer-summary-row > span:first-child {
+  color: var(--blue);
+  font-weight: 600;
+}
+.report-viewer-summary-row > span:last-child {
+  color: var(--muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+.report-viewer-shot {
+  min-height: 240px;
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+}
+.report-viewer-text {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+.report-viewer-text h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+}
+.report-viewer-text p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.light .report-viewer-summary article,
+.light .report-viewer-page,
+.light .report-viewer-shot {
+  background: var(--panel);
+  border-color: var(--border-soft);
+}
+.light .report-viewer-page-head {
+  border-color: var(--border-soft);
+}
+.light .report-viewer-text h4,
+.light .report-viewer-page-head b,
+.light .report-viewer-summary article strong {
+  color: var(--text);
+}
+.light .titlebar {
+  background: linear-gradient(90deg, #ffffff, #f8fafc 60%);
+}
+.light .sidebar {
+  background: #ffffff;
+}
+.light .statusbar {
+  background: #ffffff;
+}
+.light .report-viewer-page-head:hover,
+.light .report-viewer-summary-collapsed:hover,
+.light .page-card:hover,
+.light .report-row:hover,
+.light .report-viewer-page:hover,
+.light .recent-list button:hover {
+  background: #f8fafc;
+}
+
