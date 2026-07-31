@@ -83,6 +83,16 @@ def load_run_elapsed(run_dir: Path) -> float | None:
     try:
         data = json.loads(run_metadata_path(run_dir).read_text(encoding="utf-8"))
         started_at = float(data.get("started_at"))
+        # 检测 started_at 是否为 perf_counter 值（非 Unix 时间戳）
+        # Unix 时间戳 2020-2030 范围约 1.57e9 ~ 1.89e9
+        # perf_counter 值通常远小于 1e9
+        if started_at < 1e9:
+            # 旧版本 bug：存了 perf_counter，回退到 result.json 的修改时间
+            result_path = run_dir / "result.json"
+            if result_path.exists():
+                started_at = result_path.stat().st_mtime
+            else:
+                return None
         elapsed = time.time() - started_at
         return round(max(elapsed, 0.0), 3)
     except Exception:
