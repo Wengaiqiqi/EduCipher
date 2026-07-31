@@ -1336,6 +1336,10 @@ select:focus-visible {
   margin: 0;
 }
 
+.aligned-fields {
+  align-items: end;
+}
+
 .wide-field {
   grid-column: 1 / -1;
 }

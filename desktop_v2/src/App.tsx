@@ -333,7 +333,6 @@ function Inspector({
 }: {
   page?: PageRecord;
 }) {
-  const [showEvidence, setShowEvidence] = useState(false);
   return (
     <aside className="inspector">
       <div className="inspector-header">
@@ -380,24 +379,6 @@ function Inspector({
                 : "本页完成语音识别和关联度评分后，将在这里展示判断理由。")}
           </p>
         </section>
-        <div className="divider" />
-        <label className="toggle-row">
-          <span>
-            显示对应证据
-            <small>打开后显示 PPT 与讲话的对应内容</small>
-          </span>
-          <input
-            type="checkbox"
-            checked={showEvidence}
-            onChange={(event) => setShowEvidence(event.target.checked)}
-          />
-          <i />
-        </label>
-        {showEvidence && (
-          <div className="evidence-panel">
-            当前任务需要在设置中打开“返回详细对应证据”后重新评分，才会生成完整证据。
-          </div>
-        )}
       </div>
     </aside>
   );
@@ -448,23 +429,40 @@ function SettingsModal({
             {draft.asr_engine === "faster-whisper" ? (
               <label>本地模型<input value={draft.asr_model} onChange={(e) => update("asr_model", e.target.value)} /></label>
             ) : (
-              <div className="form-two-columns">
+              <div className="form-two-columns aligned-fields">
                 <label className="wide-field">ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
                 <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
-                <label>并发上限<input type="number" min={1} max={10} value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))} /></label>
+                <label>
+                  并发上限
+                  <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
+                    {[1,2,3,4,5,6,7,8,9,10].map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </label>
               </div>
             )}
           </section>
           <section className="wide">
             <h3><WandSparkles size={17} /> LLM 关联度评分</h3>
             <div className="form-two-columns aligned-fields">
-              <label>模型名称<input value={draft.llm_model} onChange={(e) => update("llm_model", e.target.value)} /></label>
-              <label>并发上限<input type="number" min={1} max={10} value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))} /></label>
+              <label>
+                模型名称
+                <input value={draft.llm_model} onChange={(e) => update("llm_model", e.target.value)} />
+              </label>
+              <label>
+                并发上限
+                <select value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))}>
+                  {[1,2,3,4,5,6,7,8,9,10].map((n) => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </label>
               <label className="wide-field">OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} /></label>
             </div>
-            <div className="inline-options">
-              <label className="check-label"><input type="checkbox" checked={draft.include_evidence} onChange={(e) => update("include_evidence", e.target.checked)} /> 返回详细对应证据</label>
-            </div>
+            <label>
+              返回详细对应证据
+              <select value={draft.include_evidence ? "true" : "false"} onChange={(e) => update("include_evidence", e.target.value === "true")}>
+                <option value="false">关闭</option>
+                <option value="true">开启</option>
+              </select>
+            </label>
           </section>
         </div>
         <div className="modal-actions">
@@ -568,13 +566,8 @@ function NewTaskModal({
             </button>
           </label>
           {mode === "full" && (
-            <div className="cloud-auth-card">
-              <div>
-                <Cloud size={18} />
-                <strong>云端服务授权</strong>
-                <span>密钥只在本次任务的内存中使用，不写入设置。</span>
-              </div>
-              <label>MiMo API Key（已设置环境变量可留空）<input type="password" value={asrKey} onChange={(e) => setAsrKey(e.target.value)} placeholder="sk-••••••••" /></label>
+            <div className="form-two-columns">
+              <label>ASR API Key（已设置环境变量可留空）<input type="password" value={asrKey} onChange={(e) => setAsrKey(e.target.value)} placeholder="sk-••••••••" /></label>
               <label>LLM API Key（已设置环境变量可留空）<input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} placeholder="sk-••••••••" /></label>
             </div>
           )}
