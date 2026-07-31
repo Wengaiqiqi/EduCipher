@@ -1858,13 +1858,28 @@ select:focus-visible {
   font-size: 26px;
   font-weight: 650;
 }
-.report-viewer-list {
+.report-viewer-page-view {
   flex: 1;
   min-height: 0;
   overflow: auto;
   padding: 18px 22px 22px;
-  display: grid;
-  gap: 14px;
+}
+.report-viewer-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 12px 22px 16px;
+  border-top: 1px solid var(--border);
+}
+.report-viewer-nav button {
+  min-width: 100px;
+}
+.report-viewer-page-counter {
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 60px;
+  text-align: center;
 }
 .report-viewer-page {
   border: 1px solid var(--border);

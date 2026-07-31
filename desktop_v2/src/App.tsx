@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
+	  ChevronRight,
   CircleDot,
   Cloud,
   FileText,
@@ -249,7 +250,14 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
   const score = Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0);
   const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
   const [showEvidence, setShowEvidence] = useState(false);
+  const [pageIndex, setPageIndex] = useState(0);
   const includeEvidence = settings?.include_evidence ?? false;
+  const pages = task.pages;
+  const page = pages[pageIndex];
+  const hasPrev = pageIndex > 0;
+  const hasNext = pageIndex < pages.length - 1;
+  const text = page?.speech_text?.trim() || "";
+  const reason = page?.reason || "";
   return (
     <div className="modal-backdrop report-viewer-backdrop">
       <div className="modal report-viewer-modal">
@@ -263,41 +271,46 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
         <div className="report-viewer-summary">
           <article><Gauge /><span>总关联度</span><strong>{Math.round(score) || "—"}</strong></article>
           <article><History /><span>讲话覆盖率</span><strong>{Math.round(coverage)}%</strong></article>
-          <article><CheckCircle2 /><span>已完成页</span><strong>{task.pages.filter((p) => p.status === "completed").length}</strong></article>
-          <article><FileText /><span>总页数</span><strong>{task.pages.length}</strong></article>
+          <article><CheckCircle2 /><span>已完成页</span><strong>{pages.filter((p) => p.status === "completed").length}</strong></article>
+          <article><FileText /><span>总页数</span><strong>{pages.length}</strong></article>
         </div>
-        <div className="report-viewer-list">
-          {task.pages.map((page) => {
-            const text = page.speech_text?.trim() || "";
-            const reason = page.reason || "";
-            return (
-              <section className="report-viewer-page" key={page.page_id}>
-                <div className="report-viewer-page-head">
-                  <strong>第 {page.page_id} 页</strong>
-                  <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
-                  {page.score != null && <b>{Math.round(page.score)}分</b>}
-                </div>
-                <div className="report-viewer-page-score"><i style={{ width: `${page.score || 0}%` }} /></div>
-                <div className="report-viewer-page-body">
-                  <div className="report-viewer-shot">
-                    <SlideImage page={page} key={"r" + page.page_id + (page.screenshot_path || "")} />
+        {page && (
+          <div className="report-viewer-page-view">
+            <div className="report-viewer-page-head">
+              <strong>第 {page.page_id} 页</strong>
+              <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
+              {page.score != null && <b>{Math.round(page.score)}分</b>}
+            </div>
+            <div className="report-viewer-page-score">
+              <i style={{ width: `${page.score || 0}%` }} />
+            </div>
+            <div className="report-viewer-page-body">
+              <div className="report-viewer-shot">
+                <SlideImage page={page} key={"r" + page.page_id + (page.screenshot_path || "")} />
+              </div>
+              <div className="report-viewer-text">
+                <h4>原始转录</h4>
+                <p>{text || "暂无语音识别内容。"}</p>
+                <h4>评分理由</h4>
+                <p>{reason || "暂无评分理由。"}</p>
+                {includeEvidence && showEvidence && (
+                  <div className="evidence-content">
+                    <h4>对应证据</h4>
+                    <p>{reason || `当前任务没有生成详细对应证据，需要在设置中打开「返回详细对应证据」后重新评分。`}</p>
                   </div>
-                  <div className="report-viewer-text">
-                    <h4>原始转录</h4>
-                    <p>{text || "暂无语音识别内容。"}</p>
-                    <h4>评分理由</h4>
-                    <p>{reason || "暂无评分理由。"}</p>
-                    {includeEvidence && showEvidence && (
-                      <div className="evidence-content">
-                        <h4>对应证据</h4>
-                        <p>{reason || `当前任务没有生成详细对应证据，需要在设置中打开「返回详细对应证据」后重新评分。`}</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </section>
-            );
-          })}
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        <div className="report-viewer-nav">
+          <button className="button secondary" disabled={!hasPrev} onClick={() => setPageIndex((i) => i - 1)}>
+            <ChevronLeft size={18} /> 上一页
+          </button>
+          <span className="report-viewer-page-counter">{pageIndex + 1} / {pages.length}</span>
+          <button className="button secondary" disabled={!hasNext} onClick={() => setPageIndex((i) => i + 1)}>
+            下一页 <ChevronRight size={18} />
+          </button>
         </div>
         {includeEvidence && (
           <div className="report-viewer-footer">
