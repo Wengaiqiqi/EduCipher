@@ -15,6 +15,7 @@ export interface PageRecord {
   score?: number;
   level?: string;
   reason?: string;
+  evidence?: Array<{ ppt: string; speech: string }>;
   status?: PageStatus;
   confidence?: string;
 }
@@ -32,6 +33,7 @@ export interface TaskRecord {
   message?: string;
   elapsed_sec?: number;
   model?: string;
+  include_evidence?: boolean;
   summary?: {
     strict_overall_score?: number;
     association_average_score?: number;
@@ -47,6 +49,8 @@ export interface AppSettings {
   detector_preset: "precise" | "fast";
   asr_engine: "mimo-cloud" | "faster-whisper";
   asr_model: string;
+  asr_api_key: string;
+  llm_api_key: string;
   mimo_base_url: string;
   mimo_model: string;
   asr_concurrency: number;
@@ -81,6 +85,7 @@ export interface WorkerEvent {
   result?: TaskRecord;
   error?: string;
   traceback?: string;
+  elapsed_sec?: number;
   active_cloud_requests?: number;
   cloud_limit?: number;
   algorithm_version?: string;

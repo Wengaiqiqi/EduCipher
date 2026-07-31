@@ -82,19 +82,22 @@ def write_run_metadata(run_dir: Path, started_at: float) -> None:
 def load_run_elapsed(run_dir: Path) -> float | None:
     try:
         data = json.loads(run_metadata_path(run_dir).read_text(encoding="utf-8"))
-        started_at = float(data.get("started_at"))
+        # 优先使用任务完成时保存的精确耗时
+        if "elapsed_sec" in data:
+            return round(max(float(data["elapsed_sec"]), 0.0), 3)
+        # 旧版：从 started_at 推算
+        started_at = float(data.get("started_at") or 0)
+        result_path = run_dir / "result.json"
+        if not result_path.exists():
+            return None
+        completed_at = result_path.stat().st_mtime
         # 检测 started_at 是否为 perf_counter 值（非 Unix 时间戳）
-        # Unix 时间戳 2020-2030 范围约 1.57e9 ~ 1.89e9
-        # perf_counter 值通常远小于 1e9
-        if started_at < 1e9:
-            # 旧版本 bug：存了 perf_counter，回退到 result.json 的修改时间
-            result_path = run_dir / "result.json"
-            if result_path.exists():
-                started_at = result_path.stat().st_mtime
-            else:
-                return None
-        elapsed = time.time() - started_at
-        return round(max(elapsed, 0.0), 3)
+        if started_at <= 0 or started_at < 1e9 or started_at > completed_at:
+            return None
+        elapsed = completed_at - started_at
+        if elapsed <= 0 or elapsed > 2592000:
+            return None
+        return round(elapsed, 3)
     except Exception:
         return None
 
@@ -166,6 +169,13 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
                 if key in {"screenshot_path", "speech_text"}:
                     continue
                 row[key] = value
+            # rename matched_evidence to evidence for frontend;
+            # 如果 matched_evidence 不存在（任务运行时 include_evidence=False），
+            # 显式设为 None 以便前端区分"未生成"和"生成为空"
+            if "matched_evidence" in row:
+                row["evidence"] = row.pop("matched_evidence")
+            elif "evidence" not in row:
+                row["evidence"] = None
             row["status"] = (
                 "failed" if page.get("status") == "failed" else "completed"
             )
@@ -174,6 +184,8 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
     except OSError:
         updated_at = 0
     elapsed = load_run_elapsed(run_dir)
+    ev_from_config = bool(evaluation.get("config", {}).get("include_evidence", False)) if evaluation else False
+    emit("worker.log", message=f"[debug] load_task: include_evidence from llm_evaluation.json config={ev_from_config}")
     return {
 
         "id": str(run_dir.resolve()),
@@ -190,6 +202,7 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         ),
         "elapsed_sec": elapsed,
         "model": str(evaluation.get("model") or "") if evaluation else "",
+        "include_evidence": bool(evaluation.get("config", {}).get("include_evidence", False)) if evaluation else False,
         "summary": (
             evaluation.get("summary", {})
             if evaluation
@@ -290,6 +303,8 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
         if config_path.is_file()
         else LLMEvaluationConfig()
     )
+    ev = bool(settings.get("include_evidence", False))
+    emit("worker.log", message=f"[debug] llm_config: include_evidence={ev}, settings keys={list(settings.keys())}")
     config = replace(
         base,
         base_url=str(settings.get("llm_base_url") or base.base_url),
@@ -297,7 +312,7 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
         max_concurrency=int(
             settings.get("llm_concurrency") or base.max_concurrency
         ),
-        include_evidence=bool(settings.get("include_evidence", False)),
+        include_evidence=ev,
     )
     config.validate()
     return config
@@ -306,10 +321,13 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
 def emit_page(
     page: Mapping[str, Any],
     status: str,
+    task_id: str = "",
     **extra: Any,
 ) -> None:
     payload = dict(page)
-    payload.update(extra)
+    # 过滤掉值为 None 的 extra 字段，避免前端收到 null 覆盖已有数据
+    payload.update((k, v) for k, v in extra.items() if v is not None)
+    payload["task_id"] = task_id
     payload["status"] = status
     if "speech_text" not in payload:
         payload["speech_text"] = page_speech_text(payload)
@@ -332,6 +350,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             raise ValueError("任务名称为空或包含 Windows 非法文件名字符。")
         mode = str(payload.get("mode") or "full")
         settings = payload.get("settings", {})
+        emit("worker.log", message=f"[debug] run_task: include_evidence={settings.get('include_evidence')}, type={type(settings.get('include_evidence')).__name__}, settings={dict(settings)}")
         if not isinstance(settings, Mapping):
             raise ValueError("桌面端设置格式不正确。")
         run_dir = output_root / video_id
@@ -408,20 +427,22 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 if stage in {"云端语音识别", "语音转写"}:
                     page = cloud_pipeline._page_transcripts.get(page_id)
                     if page:
-                        emit_page(page, "scoring" if include_llm else "completed")
+                        emit_page(page, "scoring" if include_llm else "completed", task_id=task_id)
                 elif stage == "LLM关联度评分":
                     evaluation = cloud_pipeline._evaluations.get(page_id)
                     transcript = cloud_pipeline._page_transcripts.get(
                         page_id, {"page_id": page_id}
                     )
                     if evaluation:
-                        emit_page(
-                            transcript,
-                            "completed",
+                        kwargs = dict(
                             score=evaluation.get("score"),
                             level=evaluation.get("level"),
                             reason=evaluation.get("reason"),
                         )
+                        matched = evaluation.get("matched_evidence")
+                        if matched:
+                            kwargs["evidence"] = matched
+                        emit_page(transcript, "completed", task_id=task_id, **kwargs)
 
             cloud_pipeline = CloudPagePipeline(
                 video_path=video,
@@ -448,6 +469,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             emit_page(
                 page,
                 "transcribing" if cloud_pipeline else "detected",
+                task_id=task_id,
             )
             emit(
                 "task.progress",
@@ -500,6 +522,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     emit_page(
                         page,
                         "scoring" if include_llm else "completed",
+                        task_id=task_id,
                     )
             require_not_cancelled()
             if include_llm and llm_settings:
@@ -525,19 +548,32 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     if not isinstance(page, Mapping):
                         continue
                     item = evaluation_by_id.get(int(page["page_id"]), {})
-                    emit_page(
-                        page,
-                        "completed",
+                    kwargs = dict(
                         score=item.get("score"),
                         level=item.get("level"),
                         reason=item.get("reason"),
                     )
+                    matched = item.get("matched_evidence")
+                    if matched:
+                        kwargs["evidence"] = matched
+                    emit_page(page, "completed", task_id=task_id, **kwargs)
 
+        elapsed_sec = round(time.perf_counter() - started_at, 3)
+        # 先把精确耗时保存到 run_metadata.json，再 load_task，确保耗时能被读到
+        try:
+            meta = read_json(run_metadata_path(run_dir)) or {}
+            meta["elapsed_sec"] = elapsed_sec
+            run_metadata_path(run_dir).write_text(
+                json.dumps(meta, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         task = load_task(run_dir)
         emit(
             "task.completed",
             task_id=task_id,
-            elapsed_sec=round(time.perf_counter() - started_at, 3),
+            elapsed_sec=elapsed_sec,
             result=task,
         )
     except Exception as exc:

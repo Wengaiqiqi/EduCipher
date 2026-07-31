@@ -52,6 +52,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   detector_preset: "precise",
   asr_engine: "mimo-cloud",
   asr_model: "small",
+  asr_api_key: "",
+  llm_api_key: "",
   mimo_base_url: "https://api.xiaomimimo.com/v1",
   mimo_model: "mimo-v2.5-asr",
   asr_concurrency: 3,
@@ -147,50 +149,60 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   const stage = task?.stage || "";
   const pages = task?.pages || [];
   const isRunning = task?.status === "running";
-  const isComplete = (task?.progress || 0) >= 100;
+  const isComplete = task?.status === "completed";
 
-  // Pages in each processing state — streaming mode runs stages in parallel
   const detected = pages.filter((p) => p.status !== "waiting").length;
   const transcribed = pages.filter((p) => p.status === "scoring" || p.status === "completed").length;
   const scored = pages.filter((p) => p.status === "completed" && p.score != null).length;
-
   const totalPages = Math.max(pages.length, 1);
+
   const pptPct = Math.round((detected / totalPages) * 100);
   const voicePct = pages.length ? Math.round((transcribed / totalPages) * 100) : 0;
   const llmPct = pages.length ? Math.round((scored / totalPages) * 100) : 0;
-  const stageRatio = task?.status === "completed"
-    ? 100
-    : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
+  const stageRatio = isComplete ? 100 : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
 
-  // Each stage independently active/done based on Worker stage and page data
-  const pptActive = isRunning && (stage.includes("PPT") || stage.includes("页面") || detected === 0);
-  const pptDone = detected > 0 && !pptActive;
-  const voiceActive = isRunning && (stage.includes("语音") || stage.includes("转写") || stage.includes("云端"));
-  const voiceDone = transcribed > 0 && transcribed >= detected && !voiceActive;
-  const llmActive = isRunning && (stage.includes("LLM") || stage.includes("评分"));
-  const llmDone = scored > 0 && scored >= transcribed && !llmActive;
+  // pptDone: 基于 worker 阶段而非 pages.length，避免第一页到达时误判为已完成
+  // 关键：stage="准备处理" 时即使 detected>0 也不能算完成（page.updated 先于 task.progress 到达）
+  const pptDone = isComplete || (detected > 0 && (!isRunning || (stage !== "准备处理" && stage !== "" && !stage.includes("PPT"))));
+  const voiceDone = isComplete || (detected > 0 && transcribed === detected);
+  const llmDone = isComplete || (scored > 0 && (!isRunning || (stage !== "准备处理" && stage !== "" && !stage.includes("LLM"))));
+  const reportDone = isComplete;
+
+  // Active states based on worker stage messages
+  const pptActive = isRunning && !pptDone && (stage.includes("PPT") || stage.includes("页面") || detected === 0);
+  const voiceActive = isRunning && !voiceDone && (stage.includes("语音") || stage.includes("转写") || stage.includes("云端"));
+  const llmActive = isRunning && !llmDone && (stage.includes("LLM") || stage.includes("评分"));
+  const reportActive = isRunning && !reportDone && (stage.includes("报告") || (!pptActive && !voiceActive && !llmActive && isRunning));
 
   const stages = [
-    { label: "PPT识别",     active: pptActive,   done: pptDone || isComplete,   pct: pptPct },
-    { label: "语音识别",    active: voiceActive, done: voiceDone || isComplete, pct: voicePct },
-    { label: "关联度评分",  active: llmActive,   done: llmDone || isComplete,   pct: llmPct },
-    { label: "生成报告",    active: false,       done: isComplete,              pct: isComplete ? 100 : stageRatio },
+    { label: "PPT识别",     active: pptActive,   done: pptDone,   pct: pptPct },
+    { label: "语音识别",    active: voiceActive, done: voiceDone,  pct: voicePct },
+    { label: "关联度评分",  active: llmActive,   done: llmDone,    pct: llmPct },
+    { label: "生成报告",    active: reportActive, done: reportDone, pct: isComplete ? 100 : stageRatio },
   ];
 
   return (
     <div className="stage-pipeline">
-      {stages.map(({ label, active, done, pct }) => (
-        <div className="stage-wrap" key={label}>
-          <div className={`stage-node ${done ? "done" : ""} ${active ? "active" : ""}`}>
-            <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
-            <div>
-              <strong>{label}</strong>
-              <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : isRunning ? " · 等待中" : ""}</small>
+      {stages.map(({ label, active, done, pct }) => {
+        const isPpt = label === "PPT识别";
+        const waiting = !done && !active && isRunning;
+        return (
+          <div className="stage-wrap" key={label}>
+            <div className={`stage-node ${done ? "done" : ""} ${active ? "active" : ""} ${waiting ? "waiting" : ""}`}>
+              <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : waiting ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
+              <div>
+                <strong>{label}</strong>
+                {isPpt ? (
+                  <small>{done ? "已完成" : active ? "进行中" : waiting ? "等待中" : ""}</small>
+                ) : (
+                  <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}</small>
+                )}
+              </div>
             </div>
+            {label !== "生成报告" && <div className={`stage-link ${done ? "done" : ""}`} />}
           </div>
-          {label !== "生成报告" && <div className={`stage-link ${done ? "done" : ""}`} />}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -249,9 +261,8 @@ function PageCard({
 function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: () => void; settings?: AppSettings }) {
   const score = Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0);
   const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
-  const [showEvidence, setShowEvidence] = useState(false);
   const [pageIndex, setPageIndex] = useState(0);
-  const includeEvidence = settings?.include_evidence ?? false;
+  const evidenceEnabled = task.include_evidence ?? settings?.include_evidence ?? false;
   const pages = task.pages;
   const page = pages[pageIndex];
   const hasPrev = pageIndex > 0;
@@ -293,10 +304,31 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
                 <p>{text || "暂无语音识别内容。"}</p>
                 <h4>评分理由</h4>
                 <p>{reason || "暂无评分理由。"}</p>
-                {includeEvidence && showEvidence && (
+                {page?.evidence != null && page.evidence.length > 0 && (page?.status === "completed" || page?.status === "failed") && (
                   <div className="evidence-content">
                     <h4>对应证据</h4>
-                    <p>{reason || `当前任务没有生成详细对应证据，需要在设置中打开「返回详细对应证据」后重新评分。`}</p>
+                    {page.evidence.map((item, i) => (
+                      <div key={i} className="evidence-item">
+                        <div className="evidence-ppt"><b>PPT：</b>{item.ppt}</div>
+                        <div className="evidence-speech"><b>讲话：</b>{item.speech}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {page?.evidence == null && (page?.status === "completed" || page?.status === "failed") && (
+                  <div className="evidence-content">
+                    <h4>对应证据</h4>
+                    {evidenceEnabled ? (
+                      <p>该页面没有匹配到对应证据。LLM 评估时可能未返回详细证据项。</p>
+                    ) : (
+                      <p>当前任务运行时的设置中「返回详细对应证据」为关闭状态，因此没有生成对应证据。请在设置中开启后，对<strong>新任务</strong>生效。</p>
+                    )}
+                  </div>
+                )}
+                {page?.evidence != null && page.evidence.length === 0 && (page?.status === "completed" || page?.status === "failed") && (
+                  <div className="evidence-content">
+                    <h4>对应证据</h4>
+                    <p>该页面没有匹配到对应证据。</p>
                   </div>
                 )}
               </div>
@@ -312,27 +344,20 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
             下一页 <ChevronRight size={18} />
           </button>
         </div>
-        {includeEvidence && (
-          <div className="report-viewer-footer">
-            <label className="toggle-row">
-              <span>
-                显示对应证据
-                <small>打开后显示 PPT 与讲话的对应内容</small>
-              </span>
-              <input type="checkbox" checked={showEvidence} onChange={(e) => setShowEvidence(e.target.checked)} />
-              <i />
-            </label>
-          </div>
-        )}
       </div>
     </div>
   );
 }
 function Inspector({
   page,
+  task,
+  settings,
 }: {
   page?: PageRecord;
+  task?: TaskRecord;
+  settings?: AppSettings;
 }) {
+  const evidenceEnabled = task?.include_evidence ?? settings?.include_evidence ?? false;
   return (
     <aside className="inspector">
       <div className="inspector-header">
@@ -378,6 +403,33 @@ function Inspector({
                 ? "评分已完成，当前服务没有返回详细理由。"
                 : "本页完成语音识别和关联度评分后，将在这里展示判断理由。")}
           </p>
+          {page?.evidence != null && page.evidence.length > 0 && (page?.status === "completed" || page?.status === "failed") && (
+            <div className="evidence-content" style={{ marginTop: 12 }}>
+              <h4 style={{ margin: "0 0 8px", fontSize: 14, color: "var(--text)" }}>对应证据</h4>
+              {page.evidence.map((item, i) => (
+                <div key={i} className="evidence-item" style={{ marginBottom: 8 }}>
+                  <div className="evidence-ppt"><b>PPT：</b>{item.ppt}</div>
+                  <div className="evidence-speech"><b>讲话：</b>{item.speech}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {page?.evidence == null && (page?.status === "completed" || page?.status === "failed") && (
+            <div className="evidence-content" style={{ marginTop: 12 }}>
+              <h4 style={{ margin: "0 0 8px", fontSize: 14, color: "var(--text)" }}>对应证据</h4>
+              {evidenceEnabled ? (
+                <p>该页面没有匹配到对应证据。LLM 评估时可能未返回详细证据项。</p>
+              ) : (
+                <p>当前任务运行时的设置中「返回详细对应证据」为关闭状态，因此没有生成对应证据。请在设置中开启后，对<strong>新任务</strong>生效。</p>
+              )}
+            </div>
+          )}
+          {page?.evidence != null && page.evidence.length === 0 && (page?.status === "completed" || page?.status === "failed") && (
+            <div className="evidence-content" style={{ marginTop: 12 }}>
+              <h4 style={{ margin: "0 0 8px", fontSize: 14, color: "var(--text)" }}>对应证据</h4>
+              <p>该页面没有匹配到对应证据。</p>
+            </div>
+          )}
         </section>
       </div>
     </aside>
@@ -402,7 +454,7 @@ function SettingsModal({
         <div className="modal-header">
           <div>
             <h2>模型与处理设置</h2>
-            <p>密钥不会保存在这里，只在新建任务时临时输入。</p>
+            <p>API Key 会保存在本地，用于新建任务时自动填充。</p>
           </div>
           <button className="icon-button" onClick={onClose}><X size={19} /></button>
         </div>
@@ -440,6 +492,7 @@ function SettingsModal({
                 </label>
               </div>
             )}
+            <label>ASR API Key<input type="password" value={draft.asr_api_key} onChange={(e) => update("asr_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
           </section>
           <section className="wide">
             <h3><WandSparkles size={17} /> LLM 关联度评分</h3>
@@ -463,6 +516,7 @@ function SettingsModal({
                 <option value="true">开启</option>
               </select>
             </label>
+            <label>LLM API Key<input type="password" value={draft.llm_api_key} onChange={(e) => update("llm_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
           </section>
         </div>
         <div className="modal-actions">
@@ -487,10 +541,6 @@ function NewTaskModal({
   const [outputRoot, setOutputRoot] = useState(settings.output_root);
   const [videoId, setVideoId] = useState("");
   const [mode, setMode] = useState<"full" | "detect">("full");
-  const [asrKey, setAsrKey] = useState("");
-  const [llmKey, setLlmKey] = useState("");
-  const [asrConsent, setAsrConsent] = useState(true);
-  const [llmConsent, setLlmConsent] = useState(true);
   const [error, setError] = useState("");
 
   async function chooseVideo() {
@@ -521,10 +571,10 @@ function NewTaskModal({
       video_id: videoId.trim(),
       mode,
       settings,
-      asr_api_key: asrKey,
-      llm_api_key: llmKey,
-      asr_upload_consent: asrConsent,
-      llm_upload_consent: llmConsent,
+      asr_api_key: settings.asr_api_key,
+      llm_api_key: settings.llm_api_key,
+      asr_upload_consent: true,
+      llm_upload_consent: true,
     });
   }
 
@@ -565,12 +615,6 @@ function NewTaskModal({
               <ChevronDown size={16} />
             </button>
           </label>
-          {mode === "full" && (
-            <div className="form-two-columns">
-              <label>ASR API Key（已设置环境变量可留空）<input type="password" value={asrKey} onChange={(e) => setAsrKey(e.target.value)} placeholder="sk-••••••••" /></label>
-              <label>LLM API Key（已设置环境变量可留空）<input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} placeholder="sk-••••••••" /></label>
-            </div>
-          )}
           {error && <div className="form-error"><XCircle size={16} />{error}</div>}
         </div>
         <div className="modal-actions">
@@ -626,7 +670,6 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [cloudActive, setCloudActive] = useState(0);
   const [error, setError] = useState("");
-  const [elapsed, setElapsed] = useState(0);
   const [workerStatus, setWorkerStatus] = useState<"starting" | "ready" | "failed">("starting");
   const [algorithmVersion, setAlgorithmVersion] = useState("");
   const [workerLogs, setWorkerLogs] = useState<string[]>([]);
@@ -715,7 +758,6 @@ export default function App() {
         setActiveTaskId(task.id);
         setSelectedPageId(null);
         setError("");
-        setElapsed(0);
       } else if (data.type === "task.progress") {
         setTasks((current) =>
           current.map((task) =>
@@ -729,6 +771,7 @@ export default function App() {
       } else if (data.type === "page.updated" && data.page) {
         setTasks((current) =>
           current.map((task) => {
+            if (data.task_id && task.id !== data.task_id) return task;
             if (task.status !== "running") return task;
             const exists = task.pages.some((page) => page.page_id === data.page!.page_id);
             const pages = exists
@@ -739,15 +782,14 @@ export default function App() {
         );
         setSelectedPageId((current) => current ?? data.page!.page_id);
       } else if (data.type === "task.completed" && data.result) {
-        setTasks((current) => [data.result!, ...current.filter((task) => task.id !== data.result!.id)]);
-        setActiveTaskId(data.result.id);
-        setElapsed((data as WorkerEvent & { elapsed_sec?: number }).elapsed_sec || 0);
+        const result = { ...data.result, elapsed_sec: data.elapsed_sec ?? data.result.elapsed_sec };
+        setTasks((current) => [result, ...current.filter((task) => task.id !== result.id)]);
+        setActiveTaskId(result.id);
         setCloudActive(0);
-        sendWorker({ action: "list_tasks", output_root: settingsRef.current.output_root });
       } else if (data.type === "task.failed") {
         setError(data.error || "任务处理失败。");
         setCloudActive(0);
-        setTasks((current) => current.map((task) => task.status === "running" ? { ...task, status: "failed", stage: "处理失败" } : task));
+        setTasks((current) => current.map((task) => (task.id === (data.task_id || task.id) && task.status === "running") ? { ...task, status: "failed", stage: "处理失败" } : task));
       }
     }).then((dispose) => {
       unlisten = dispose;
@@ -757,9 +799,14 @@ export default function App() {
 
   useEffect(() => {
     if (!activeTask || activeTask.status !== "running") return;
-    const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000);
+    const id = activeTaskId;
+    const timer = window.setInterval(() => {
+      setTasks((current) => current.map((t) =>
+        t.id === id ? { ...t, elapsed_sec: (t.elapsed_sec || 0) + 1 } : t,
+      ));
+    }, 1000);
     return () => window.clearInterval(timer);
-  }, [activeTask?.status]);
+  }, [activeTaskId, activeTask?.status]);
 
   useEffect(() => {
     if (!activeTask) return;
@@ -888,7 +935,7 @@ export default function App() {
                   )}
                   <i />
                   <Timer size={17} />
-                  <span>{formatTime(elapsed || activeTask.elapsed_sec || 0)}</span>
+                  <span>{formatTime(activeTask?.elapsed_sec || 0)}</span>
                 </div>
               )}
               <StagePipeline task={activeTask} />
@@ -932,7 +979,7 @@ export default function App() {
               </section>
             )}
           </main>
-          <Inspector page={selectedPage} />
+          <Inspector page={selectedPage} task={activeTask} settings={settings} />
         </>
       )}
 
