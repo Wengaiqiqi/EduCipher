@@ -37,11 +37,11 @@ class DesktopV2WorkerTests(unittest.TestCase):
         self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
         self.assertFalse(llm_config({"include_evidence": False}).include_evidence)
 
-    def test_desktop_cloud_concurrency_settings_are_capped_at_five(self) -> None:
-        self.assertEqual(llm_config({"llm_concurrency": 10}).max_concurrency, 5)
+    def test_desktop_cloud_concurrency_settings_are_capped_at_ten(self) -> None:
+        self.assertEqual(llm_config({"llm_concurrency": 10}).max_concurrency, 10)
         self.assertEqual(
             transcription_config({"asr_concurrency": 10}).mimo_max_concurrency,
-            5,
+            10,
         )
 
     def test_combines_utterance_text(self) -> None:

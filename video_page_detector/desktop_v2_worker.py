@@ -395,7 +395,7 @@ def transcription_config(settings: Mapping[str, Any]) -> TranscriptionConfig:
         ),
         mimo_model=str(settings.get("mimo_model") or base.mimo_model),
         mimo_max_concurrency=min(
-            5,
+            10,
             int(settings.get("asr_concurrency") or base.mimo_max_concurrency),
         ),
         model_download_root=str(resource_path("models/faster-whisper")),
@@ -418,7 +418,7 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
         base_url=str(settings.get("llm_base_url") or base.base_url),
         model=str(settings.get("llm_model") or base.model),
         max_concurrency=min(
-            5,
+            10,
             int(settings.get("llm_concurrency") or base.max_concurrency),
         ),
         include_evidence=ev,
@@ -568,6 +568,12 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 llm_config=llm_settings,
                 llm_api_key=llm_key,
                 progress_callback=pipeline_progress,
+                cloud_activity_callback=lambda active, limit: emit(
+                    "cloud.activity",
+                    task_id=task_id,
+                    active_cloud_requests=active,
+                    cloud_limit=limit,
+                ),
                 cancel_event=_cancel_event,
             )
 
@@ -683,6 +689,12 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     output_dir=evaluation_dir,
                     api_key=llm_key,
                     progress_callback=evaluation_progress,
+                    activity_callback=lambda active, limit: emit(
+                        "cloud.activity",
+                        task_id=task_id,
+                        active_cloud_requests=active,
+                        cloud_limit=limit,
+                    ),
                 )
                 evaluation_by_id = {
                     int(item["page_id"]): item

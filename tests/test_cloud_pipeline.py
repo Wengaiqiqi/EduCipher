@@ -10,7 +10,7 @@ from video_page_detector.transcription import TranscriptionConfig
 
 
 class CloudPagePipelineTests(unittest.TestCase):
-    def test_combined_cloud_concurrency_is_capped_at_five(self) -> None:
+    def test_combined_cloud_concurrency_is_capped_at_ten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video = root / "lesson.mp4"
@@ -43,7 +43,63 @@ class CloudPagePipelineTests(unittest.TestCase):
                 transcript["transcription"]["cloud_statistics"][
                     "combined_cloud_concurrency_limit"
                 ],
-                5,
+                10,
+            )
+
+    def test_cloud_activity_reports_real_active_and_peak_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+            release = threading.Event()
+            all_started = threading.Event()
+            started = 0
+            started_lock = threading.Lock()
+            activity: list[tuple[int, int]] = []
+
+            def asr_runner(page: dict) -> tuple[dict, dict]:
+                nonlocal started
+                with started_lock:
+                    started += 1
+                    if started == 3:
+                        all_started.set()
+                release.wait(timeout=3)
+                return {**page, "utterances": []}, {}
+
+            pipeline = CloudPagePipeline(
+                video_path=video,
+                result_path=root / "result.json",
+                output_dir=root,
+                transcription_config=TranscriptionConfig(
+                    engine="mimo-cloud",
+                    mimo_max_concurrency=3,
+                ),
+                asr_api_key="",
+                asr_runner=asr_runner,
+                cloud_activity_callback=lambda active, limit: activity.append(
+                    (active, limit)
+                ),
+            )
+            pages = [
+                {"page_id": page_id, "start_sec": page_id - 1, "end_sec": page_id}
+                for page_id in range(1, 4)
+            ]
+            for page_id, page in enumerate(pages, start=1):
+                pipeline.submit_page(page, page_id, len(pages))
+
+            self.assertTrue(all_started.wait(timeout=1))
+            self.assertEqual(max(active for active, _ in activity), 3)
+            self.assertTrue(all(limit == 3 for _, limit in activity))
+            release.set()
+            transcript, _ = pipeline.finish(
+                {"video_id": "lesson", "pages": pages}
+            )
+            self.assertEqual(activity[-1][0], 0)
+            self.assertEqual(
+                transcript["transcription"]["cloud_statistics"][
+                    "peak_combined_cloud_requests"
+                ],
+                3,
             )
 
     def test_abort_does_not_wait_for_running_cloud_request(self) -> None:
@@ -184,7 +240,7 @@ class CloudPagePipelineTests(unittest.TestCase):
                 transcript["transcription"]["cloud_statistics"][
                     "combined_cloud_concurrency_limit"
                 ],
-                2,
+                4,
             )
             self.assertIsNotNone(evaluation)
             assert evaluation is not None

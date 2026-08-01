@@ -62,6 +62,31 @@ const DEFAULT_SETTINGS: AppSettings = {
   include_evidence: false,
 };
 
+const MAX_SHARED_CLOUD_REQUESTS = 10;
+
+function normalizeCloudConcurrency(value: AppSettings): AppSettings {
+  let asrConcurrency = Math.min(
+    MAX_SHARED_CLOUD_REQUESTS,
+    Math.max(1, Number(value.asr_concurrency) || 1),
+  );
+  let llmConcurrency = Math.min(
+    MAX_SHARED_CLOUD_REQUESTS,
+    Math.max(1, Number(value.llm_concurrency) || 1),
+  );
+  if (value.asr_engine === "mimo-cloud" && value.include_llm) {
+    asrConcurrency = Math.min(MAX_SHARED_CLOUD_REQUESTS - 1, asrConcurrency);
+    llmConcurrency = Math.min(
+      MAX_SHARED_CLOUD_REQUESTS - asrConcurrency,
+      llmConcurrency,
+    );
+  }
+  return {
+    ...value,
+    asr_concurrency: asrConcurrency,
+    llm_concurrency: llmConcurrency,
+  };
+}
+
 
 type NavKey = "tasks" | "reports" | "settings";
 
@@ -451,7 +476,13 @@ function SettingsModal({
 }) {
   const [draft, setDraft] = useState(settings);
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
-    setDraft((current) => ({ ...current, [key]: value }));
+    setDraft((current) => normalizeCloudConcurrency({ ...current, [key]: value }));
+  const asrConcurrencyMax = draft.include_llm
+    ? MAX_SHARED_CLOUD_REQUESTS - 1
+    : MAX_SHARED_CLOUD_REQUESTS;
+  const llmConcurrencyMax = draft.asr_engine === "mimo-cloud" && draft.include_llm
+    ? MAX_SHARED_CLOUD_REQUESTS - draft.asr_concurrency
+    : MAX_SHARED_CLOUD_REQUESTS;
   return (
     <div className="modal-backdrop">
       <div className="modal settings-modal">
@@ -492,7 +523,7 @@ function SettingsModal({
                   <label>
                     并发上限
                     <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
-                    {[1,2,3,4,5].map((n) => <option key={n} value={n}>{n}</option>)}
+                    {Array.from({ length: asrConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
                     </select>
                   </label>
                 </div>
@@ -510,7 +541,7 @@ function SettingsModal({
               <label>
                 并发上限
                 <select value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))}>
-                  {[1,2,3,4,5].map((n) => <option key={n} value={n}>{n}</option>)}
+                  {Array.from({ length: llmConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
                 </select>
               </label>
               <label className="wide-field">OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} /></label>
@@ -753,6 +784,7 @@ export default function App() {
         return;
       }
       if (data.type === "task.started") {
+        setCloudActive(0);
         const task: TaskRecord = {
           id: data.task_id || `task-${Date.now()}`,
           video_id: (data as WorkerEvent & { video_id?: string }).video_id || "新任务",
@@ -770,6 +802,8 @@ export default function App() {
         setActiveTaskId(task.id);
         setSelectedPageId(null);
         setError("");
+      } else if (data.type === "cloud.activity") {
+        setCloudActive(Math.max(0, Number(data.active_cloud_requests) || 0));
       } else if (data.type === "task.progress") {
         setTasks((current) =>
           current.map((task) =>
@@ -795,8 +829,6 @@ export default function App() {
             })() : task,
           ),
         );
-        if (data.stage?.includes("语音")) setCloudActive((value) => Math.max(1, value));
-        if (data.stage?.includes("LLM") || data.stage?.includes("评分")) setCloudActive((value) => Math.max(2, value));
       } else if (data.type === "page.updated" && data.page) {
         setTasks((current) =>
           current.map((task) => {
@@ -829,9 +861,7 @@ export default function App() {
       const output = await invoke<string>("project_output_dir");
       const merged = { ...DEFAULT_SETTINGS, ...restored };
       if (!merged.output_root) merged.output_root = output;
-      merged.asr_concurrency = Math.min(5, Math.max(1, Number(merged.asr_concurrency) || 1));
-      merged.llm_concurrency = Math.min(5, Math.max(1, Number(merged.llm_concurrency) || 1));
-      setSettings(merged);
+      setSettings(normalizeCloudConcurrency(merged));
       await sendWorker({ action: "ping" });
       await sendWorker({ action: "list_tasks", output_root: merged.output_root });
     }).catch((reason) => {
@@ -876,18 +906,19 @@ export default function App() {
   }
 
   async function saveSettings(value: AppSettings) {
-    setSettings(value);
+    const normalized = normalizeCloudConcurrency(value);
+    setSettings(normalized);
     localStorage.setItem(
       "kexi.settings",
       JSON.stringify({
-        ...value,
+        ...normalized,
         asr_api_key: "",
         llm_api_key: "",
       }),
     );
     setShowSettings(false);
     try {
-      await sendWorker({ action: "list_tasks", output_root: value.output_root });
+      await sendWorker({ action: "list_tasks", output_root: normalized.output_root });
     } catch (reason) {
       setWorkerStatus("failed");
       setError(`设置已保存，但无法刷新任务列表：${String(reason)}`);
@@ -1055,7 +1086,7 @@ export default function App() {
       )}
 
       <footer className="statusbar">
-        <div><Cloud size={15} /><span>云端请求</span><strong>{cloudActive} / 5</strong><i className="mini-progress"><b style={{ width: `${cloudActive / 5 * 100}%` }} /></i></div>
+        <div><Cloud size={15} /><span>当前云端并发</span><strong>{cloudActive}</strong></div>
         <div><CheckCircle2 size={16} /><span>已完成</span><strong>{completedPages} 页</strong></div>
         <div className={failedPages ? "has-error" : ""}><XCircle size={16} /><strong>{failedPages}</strong><span>个错误</span></div>
         <div className="status-spacer" />

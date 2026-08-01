@@ -85,6 +85,7 @@ ModelRequester = Callable[
     Awaitable[dict[str, Any]],
 ]
 ProgressCallback = Callable[[str, int, int], None]
+ActivityCallback = Callable[[int, int], None]
 
 
 def _chat_completions_endpoint(base_url: str) -> str:
@@ -719,6 +720,7 @@ async def evaluate_transcript_async(
     output_dir: str | Path | None = None,
     api_key: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    activity_callback: ActivityCallback | None = None,
     requester: ModelRequester | None = None,
 ) -> dict[str, Any]:
     config.validate()
@@ -742,6 +744,16 @@ async def evaluate_transcript_async(
     semaphore = asyncio.Semaphore(config.max_concurrency)
     completed = 0
     completed_lock = asyncio.Lock()
+    active = 0
+    active_lock = asyncio.Lock()
+
+    async def report_activity(delta: int) -> None:
+        nonlocal active
+        async with active_lock:
+            active = max(0, active + delta)
+            current = active
+        if activity_callback is not None:
+            activity_callback(current, config.max_concurrency)
 
     async def report(message: str) -> None:
         nonlocal completed
@@ -754,14 +766,18 @@ async def evaluate_transcript_async(
         page: dict[str, Any],
     ) -> dict[str, Any]:
         async with semaphore:
-            result = await evaluate_page_async(
-                page,
-                transcript_path=transcript_file,
-                config=config,
-                output_dir=destination,
-                api_key=resolved_api_key,
-                requester=requester,
-            )
+            await report_activity(1)
+            try:
+                result = await evaluate_page_async(
+                    page,
+                    transcript_path=transcript_file,
+                    config=config,
+                    output_dir=destination,
+                    api_key=resolved_api_key,
+                    requester=requester,
+                )
+            finally:
+                await report_activity(-1)
         await report(f"第 {page['page_id']} 页：{result['status']}")
         return result
 
@@ -808,6 +824,7 @@ def evaluate_transcript(
     output_dir: str | Path | None = None,
     api_key: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    activity_callback: ActivityCallback | None = None,
     requester: ModelRequester | None = None,
 ) -> dict[str, Any]:
     return asyncio.run(
@@ -817,6 +834,7 @@ def evaluate_transcript(
             output_dir=output_dir,
             api_key=api_key,
             progress_callback=progress_callback,
+            activity_callback=activity_callback,
             requester=requester,
         )
     )

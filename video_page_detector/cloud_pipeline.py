@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -23,12 +24,13 @@ from .transcription import (
 
 
 PipelineProgressCallback = Callable[[str, str, int, int], None]
+CloudActivityCallback = Callable[[int, int], None]
 PageASRRunner = Callable[
     [Mapping[str, Any]],
     tuple[dict[str, Any], dict[str, Any]],
 ]
 PageLLMRunner = Callable[[Mapping[str, Any]], dict[str, Any]]
-MAX_COMBINED_CLOUD_REQUESTS = 5
+MAX_COMBINED_CLOUD_REQUESTS = 10
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -55,6 +57,7 @@ class CloudPagePipeline:
         llm_config: LLMEvaluationConfig | None = None,
         llm_api_key: str | None = None,
         progress_callback: PipelineProgressCallback | None = None,
+        cloud_activity_callback: CloudActivityCallback | None = None,
         asr_runner: PageASRRunner | None = None,
         llm_runner: PageLLMRunner | None = None,
         cancel_event: threading.Event | None = None,
@@ -77,16 +80,15 @@ class CloudPagePipeline:
         self.llm_config = llm_config
         self.llm_api_key = llm_api_key or ""
         self.progress_callback = progress_callback
+        self.cloud_activity_callback = cloud_activity_callback
         self._asr_runner = asr_runner
         self._llm_runner = llm_runner
         self._cancel_event = cancel_event
         self._lock = threading.Lock()
         self._cloud_concurrency_limit = min(
             MAX_COMBINED_CLOUD_REQUESTS,
-            max(
-                transcription_config.mimo_max_concurrency,
-                llm_config.max_concurrency if llm_config is not None else 1,
-            ),
+            transcription_config.mimo_max_concurrency
+            + (llm_config.max_concurrency if llm_config is not None else 0),
         )
         self._cloud_slots = threading.BoundedSemaphore(
             self._cloud_concurrency_limit
@@ -112,6 +114,8 @@ class CloudPagePipeline:
         self._total_pages = 0
         self._asr_completed = 0
         self._llm_completed = 0
+        self._active_cloud_requests = 0
+        self._peak_cloud_requests = 0
         self._first_asr_submitted_at: float | None = None
         self._last_asr_completed_at: float | None = None
         self._first_llm_submitted_at: float | None = None
@@ -156,6 +160,33 @@ class CloudPagePipeline:
         if self.progress_callback is not None:
             self.progress_callback(stage, message, completed, total)
 
+    def _report_cloud_activity(self, active: int) -> None:
+        if self.cloud_activity_callback is not None:
+            self.cloud_activity_callback(active, self._cloud_concurrency_limit)
+
+    @contextmanager
+    def _cloud_request(self):
+        self._cloud_slots.acquire()
+        try:
+            with self._lock:
+                self._active_cloud_requests += 1
+                self._peak_cloud_requests = max(
+                    self._peak_cloud_requests,
+                    self._active_cloud_requests,
+                )
+                active = self._active_cloud_requests
+            self._report_cloud_activity(active)
+            yield
+        finally:
+            with self._lock:
+                self._active_cloud_requests = max(
+                    0,
+                    self._active_cloud_requests - 1,
+                )
+                active = self._active_cloud_requests
+            self._cloud_slots.release()
+            self._report_cloud_activity(active)
+
     def submit_page(
         self,
         page: Mapping[str, Any],
@@ -193,7 +224,7 @@ class CloudPagePipeline:
         page: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self._raise_if_cancelled()
-        with self._cloud_slots:
+        with self._cloud_request():
             self._raise_if_cancelled()
             if self._asr_runner is not None:
                 return self._asr_runner(page)
@@ -280,7 +311,7 @@ class CloudPagePipeline:
         page: Mapping[str, Any],
     ) -> dict[str, Any]:
         self._raise_if_cancelled()
-        with self._cloud_slots:
+        with self._cloud_request():
             self._raise_if_cancelled()
             if self._llm_runner is not None:
                 return self._llm_runner(page)
@@ -430,6 +461,7 @@ class CloudPagePipeline:
                     "combined_cloud_concurrency_limit": (
                         self._cloud_concurrency_limit
                     ),
+                    "peak_combined_cloud_requests": self._peak_cloud_requests,
                     "max_chunk_duration_sec": (
                         self.transcription_config.mimo_max_chunk_duration_sec
                     ),

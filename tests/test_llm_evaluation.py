@@ -297,14 +297,21 @@ class LLMEvaluationTests(unittest.TestCase):
                 max_concurrency=2,
             )
             output = root / "evaluation"
+            activity: list[tuple[int, int]] = []
             first = evaluate_transcript(
                 transcript,
                 config=config,
                 output_dir=output,
                 requester=requester,
+                activity_callback=lambda active, limit: activity.append(
+                    (active, limit)
+                ),
             )
             self.assertEqual(request_count, 2)
             self.assertEqual(maximum_active, 2)
+            self.assertEqual(max(active for active, _ in activity), 2)
+            self.assertTrue(all(limit == 2 for _, limit in activity))
+            self.assertEqual(activity[-1][0], 0)
             self.assertEqual(first["pages"][1]["status"], "no_speech")
             self.assertTrue((output / "pages" / "page_001.json").is_file())
             self.assertTrue((output / "llm_evaluation.json").is_file())
