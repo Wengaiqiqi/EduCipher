@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -28,6 +28,7 @@ PageASRRunner = Callable[
     tuple[dict[str, Any], dict[str, Any]],
 ]
 PageLLMRunner = Callable[[Mapping[str, Any]], dict[str, Any]]
+MAX_COMBINED_CLOUD_REQUESTS = 5
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -56,6 +57,7 @@ class CloudPagePipeline:
         progress_callback: PipelineProgressCallback | None = None,
         asr_runner: PageASRRunner | None = None,
         llm_runner: PageLLMRunner | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         transcription_config.validate()
         if transcription_config.engine != "mimo-cloud":
@@ -77,10 +79,14 @@ class CloudPagePipeline:
         self.progress_callback = progress_callback
         self._asr_runner = asr_runner
         self._llm_runner = llm_runner
+        self._cancel_event = cancel_event
         self._lock = threading.Lock()
-        self._cloud_concurrency_limit = max(
-            transcription_config.mimo_max_concurrency,
-            llm_config.max_concurrency if llm_config is not None else 1,
+        self._cloud_concurrency_limit = min(
+            MAX_COMBINED_CLOUD_REQUESTS,
+            max(
+                transcription_config.mimo_max_concurrency,
+                llm_config.max_concurrency if llm_config is not None else 1,
+            ),
         )
         self._cloud_slots = threading.BoundedSemaphore(
             self._cloud_concurrency_limit
@@ -111,6 +117,34 @@ class CloudPagePipeline:
         self._first_llm_submitted_at: float | None = None
         self._last_llm_completed_at: float | None = None
         self._closed = False
+        self._aborted = False
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise RuntimeError("任务已由用户取消")
+
+    def _wait_for_stage(
+        self,
+        futures: list[Future[Any]],
+        completed_attribute: str,
+    ) -> None:
+        for future in futures:
+            while True:
+                self._raise_if_cancelled()
+                try:
+                    future.result(timeout=0.1)
+                    break
+                except FutureTimeoutError:
+                    continue
+                except BaseException:
+                    break
+        while True:
+            self._raise_if_cancelled()
+            with self._lock:
+                completed = int(getattr(self, completed_attribute))
+            if completed >= len(futures):
+                return
+            time.sleep(0.02)
 
     def _report(
         self,
@@ -158,7 +192,9 @@ class CloudPagePipeline:
         self,
         page: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._raise_if_cancelled()
         with self._cloud_slots:
+            self._raise_if_cancelled()
             if self._asr_runner is not None:
                 return self._asr_runner(page)
             config = self.transcription_config
@@ -185,6 +221,9 @@ class CloudPagePipeline:
         page_id: int,
         future: Future[Any],
     ) -> None:
+        with self._lock:
+            if self._aborted:
+                return
         try:
             page_transcript, statistics = future.result()
         except BaseException as exc:
@@ -202,6 +241,8 @@ class CloudPagePipeline:
             return
 
         with self._lock:
+            if self._aborted:
+                return
             self._page_transcripts[page_id] = dict(page_transcript)
             self._asr_statistics[page_id] = dict(statistics)
             self._asr_completed += 1
@@ -218,6 +259,8 @@ class CloudPagePipeline:
         if self._llm_executor is None:
             return
         with self._lock:
+            if self._aborted:
+                return
             if self._first_llm_submitted_at is None:
                 self._first_llm_submitted_at = time.perf_counter()
             llm_future = self._llm_executor.submit(
@@ -236,7 +279,9 @@ class CloudPagePipeline:
         self,
         page: Mapping[str, Any],
     ) -> dict[str, Any]:
+        self._raise_if_cancelled()
         with self._cloud_slots:
+            self._raise_if_cancelled()
             if self._llm_runner is not None:
                 return self._llm_runner(page)
             assert self.llm_config is not None
@@ -253,6 +298,9 @@ class CloudPagePipeline:
         page_id: int,
         future: Future[Any],
     ) -> None:
+        with self._lock:
+            if self._aborted:
+                return
         try:
             evaluation = dict(future.result())
         except BaseException as exc:
@@ -269,6 +317,8 @@ class CloudPagePipeline:
             if self.llm_config is not None and self.llm_config.include_evidence:
                 evaluation["matched_evidence"] = []
         with self._lock:
+            if self._aborted:
+                return
             self._evaluations[page_id] = evaluation
             self._llm_completed += 1
             self._last_llm_completed_at = time.perf_counter()
@@ -287,6 +337,15 @@ class CloudPagePipeline:
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         with self._lock:
             self._closed = True
+            asr_futures = list(self._asr_futures)
+        try:
+            self._wait_for_stage(asr_futures, "_asr_completed")
+            with self._lock:
+                llm_futures = list(self._llm_futures)
+            self._wait_for_stage(llm_futures, "_llm_completed")
+        except BaseException:
+            self.abort()
+            raise
         self._asr_executor.shutdown(wait=True)
         if self._llm_executor is not None:
             self._llm_executor.shutdown(wait=True)
@@ -317,12 +376,13 @@ class CloudPagePipeline:
 
     def abort(self) -> None:
         with self._lock:
-            if self._closed:
+            if self._aborted:
                 return
             self._closed = True
-        self._asr_executor.shutdown(wait=True, cancel_futures=True)
+            self._aborted = True
+        self._asr_executor.shutdown(wait=False, cancel_futures=True)
         if self._llm_executor is not None:
-            self._llm_executor.shutdown(wait=True, cancel_futures=True)
+            self._llm_executor.shutdown(wait=False, cancel_futures=True)
 
     def _write_transcript(
         self,

@@ -42,6 +42,26 @@ fn emit_worker_line(app: &tauri::AppHandle, line: &str) {
     let _ = app.emit("worker-event", payload);
 }
 
+fn command_output_root(command: &Value) -> Option<PathBuf> {
+    command
+        .get("output_root")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            command
+                .get("payload")
+                .and_then(|payload| payload.get("output_root"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn allow_asset_directory(app: &tauri::AppHandle, path: &PathBuf) -> Result<(), String> {
+    app.asset_protocol_scope()
+        .allow_directory(path, true)
+        .map_err(|error| format!("无法授权结果目录中的截图：{error}"))
+}
+
 fn spawn_worker(app: &tauri::AppHandle) -> Result<WorkerProcess, String> {
     let root = project_root();
     let resource_worker = app
@@ -146,6 +166,9 @@ fn send_worker_command(
     state: tauri::State<WorkerState>,
     command: Value,
 ) -> Result<(), String> {
+    if let Some(output_root) = command_output_root(&command) {
+        allow_asset_directory(&app, &output_root)?;
+    }
     let mut guard = state
         .process
         .lock()
@@ -181,6 +204,7 @@ fn project_output_dir(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|error| format!("无法读取文档目录：{error}"))?
         .join("课堂PPT处理结果");
     std::fs::create_dir_all(&output).map_err(|error| format!("无法创建默认结果目录：{error}"))?;
+    allow_asset_directory(&app, &output)?;
     Ok(output.to_string_lossy().to_string())
 }
 

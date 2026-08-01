@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,78 @@ from video_page_detector.transcription import TranscriptionConfig
 
 
 class CloudPagePipelineTests(unittest.TestCase):
+    def test_combined_cloud_concurrency_is_capped_at_five(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+
+            def asr_runner(page: dict) -> tuple[dict, dict]:
+                return {**page, "utterances": []}, {}
+
+            def llm_runner(page: dict) -> dict:
+                return {"page_id": page["page_id"], "status": "no_speech", "score": 0}
+
+            pipeline = CloudPagePipeline(
+                video_path=video,
+                result_path=root / "result.json",
+                output_dir=root,
+                transcription_config=TranscriptionConfig(
+                    engine="mimo-cloud",
+                    mimo_max_concurrency=10,
+                ),
+                asr_api_key="",
+                llm_config=LLMEvaluationConfig(max_concurrency=10),
+                llm_api_key="",
+                asr_runner=asr_runner,
+                llm_runner=llm_runner,
+            )
+            page = {"page_id": 1, "start_sec": 0.0, "end_sec": 1.0}
+            pipeline.submit_page(page, 1, 1)
+            transcript, _ = pipeline.finish({"video_id": "lesson", "pages": [page]})
+            self.assertEqual(
+                transcript["transcription"]["cloud_statistics"][
+                    "combined_cloud_concurrency_limit"
+                ],
+                5,
+            )
+
+    def test_abort_does_not_wait_for_running_cloud_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_asr(page: dict) -> tuple[dict, dict]:
+                started.set()
+                release.wait(timeout=3)
+                return {**page, "utterances": []}, {}
+
+            pipeline = CloudPagePipeline(
+                video_path=video,
+                result_path=root / "result.json",
+                output_dir=root,
+                transcription_config=TranscriptionConfig(
+                    engine="mimo-cloud",
+                    mimo_max_concurrency=1,
+                ),
+                asr_api_key="",
+                asr_runner=slow_asr,
+            )
+            pipeline.submit_page(
+                {"page_id": 1, "start_sec": 0.0, "end_sec": 1.0},
+                1,
+                1,
+            )
+            self.assertTrue(started.wait(timeout=1))
+            before = time.perf_counter()
+            pipeline.abort()
+            elapsed = time.perf_counter() - before
+            release.set()
+            self.assertLess(elapsed, 0.5)
+
     def test_asr_result_immediately_starts_page_llm(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

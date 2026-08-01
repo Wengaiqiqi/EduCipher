@@ -19,6 +19,7 @@ from tkinter.scrolledtext import ScrolledText
 from .cloud_pipeline import CloudPagePipeline
 from .config import DetectorConfig
 from .llm_evaluation import LLMEvaluationConfig, evaluate_transcript
+from .output_paths import resolve_run_directory, validate_video_id
 from .pipeline import VideoPageDetector
 from .transcription import (
     TranscriptionConfig,
@@ -29,7 +30,7 @@ from .mimo_asr import resolve_mimo_api_key
 
 
 APP_NAME = "课堂PPT智能处理"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 LOCAL_ASR_LABEL = "本地 faster-whisper"
 MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 VIDEO_FILE_TYPES = [
@@ -84,11 +85,10 @@ def open_external(path: Path) -> None:
 
 def sanitize_video_id(raw: str, fallback: str) -> str:
     value = raw.strip() or fallback.strip()
-    if not value or value in {".", ".."}:
-        raise ValueError("视频名称不能为空。")
-    if any(character in value for character in '<>:"/\\|?*'):
-        raise ValueError("视频名称不能包含 Windows 文件名非法字符。")
-    return value
+    try:
+        return validate_video_id(value)
+    except ValueError as exc:
+        raise ValueError(f"视频名称无效：{exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -105,8 +105,8 @@ def build_workflow_paths(
     output_root: str | Path,
     video_id: str,
 ) -> WorkflowPaths:
-    root = Path(output_root)
-    run_dir = root / video_id
+    root = Path(output_root).expanduser().resolve()
+    run_dir = resolve_run_directory(root, video_id)
     return WorkflowPaths(
         output_root=root,
         video_id=video_id,

@@ -11,6 +11,7 @@ from PIL import Image
 from .analysis import crop_frame, detect_screen_crop_ratios
 from .config import DetectorConfig
 from .ffmpeg_io import FFmpegError, FFmpegTools
+from .output_paths import resolve_run_directory, validate_video_id
 from .temporal import (
     TemporalFeature,
     find_state_crossover,
@@ -42,14 +43,9 @@ class BatchVideoPageDetector:
         source = Path(video_path)
         if not source.is_file():
             raise FileNotFoundError(f"Video file does not exist: {source}")
-        identifier = video_id or source.stem
-        if not identifier or identifier in {".", ".."}:
-            raise ValueError("video_id must not be empty")
-        if "/" in identifier or "\\" in identifier:
-            raise ValueError("video_id cannot contain path separators")
-
-        output_base = Path(output_root)
-        run_dir = output_base / identifier
+        identifier = validate_video_id(video_id or source.stem)
+        output_base = Path(output_root).expanduser().resolve()
+        run_dir = resolve_run_directory(output_base, identifier)
         audit_dir = run_dir / "temporal"
         audit_dir.mkdir(parents=True, exist_ok=True)
 

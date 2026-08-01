@@ -15,6 +15,7 @@ from .cloud_pipeline import CloudPagePipeline
 from .config import DetectorConfig
 from .llm_evaluation import LLMEvaluationConfig, evaluate_transcript
 from .mimo_asr import resolve_mimo_api_key
+from .output_paths import resolve_run_directory, validate_video_id
 from .pipeline import VideoPageDetector
 from .transcription import TranscriptionConfig, transcribe_video_pages
 
@@ -79,7 +80,13 @@ def run_metadata_path(run_dir: Path) -> Path:
     return run_dir / "run_metadata.json"
 
 
-def write_run_metadata(run_dir: Path, started_at: float) -> None:
+def write_run_metadata(
+    run_dir: Path,
+    started_at: float,
+    *,
+    mode: str,
+    include_llm: bool,
+) -> None:
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         run_metadata_path(run_dir).write_text(
@@ -88,6 +95,8 @@ def write_run_metadata(run_dir: Path, started_at: float) -> None:
                     "schema_version": 2,
                     "started_at": started_at,
                     "status": "running",
+                    "mode": mode,
+                    "include_llm": include_llm,
                 },
                 ensure_ascii=False,
             )
@@ -180,6 +189,7 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
     evaluation = read_json(
         run_dir / "llm_evaluation" / "llm_evaluation.json"
     )
+    metadata = read_json(run_metadata_path(run_dir)) or {}
     evaluation_pages = evaluation.get("pages", []) if evaluation else []
     evidence_enabled = bool(
         evaluation
@@ -240,6 +250,35 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
     except OSError:
         updated_at = 0
     elapsed = load_run_elapsed(run_dir)
+    evaluation_summary = evaluation.get("summary", {}) if evaluation else {}
+    failed_pages = int(evaluation_summary.get("failed_pages") or 0)
+    evaluation_complete = evaluation_summary.get("complete")
+    metadata_status = str(metadata.get("status") or "")
+    completed_with_errors = bool(
+        evaluation
+        and (failed_pages > 0 or evaluation_complete is False)
+    ) or metadata_status == "completed_with_errors"
+    if completed_with_errors:
+        task_status = "completed_with_errors"
+    elif metadata_status == "completed" or evaluation:
+        task_status = "completed"
+    elif metadata_status in {"failed", "cancelled"}:
+        task_status = "failed"
+    else:
+        task_status = "idle"
+    finished = task_status in {"completed", "completed_with_errors"}
+    mode = str(
+        metadata.get("mode")
+        or ("full" if transcript or evaluation else "detect")
+    )
+    include_llm = bool(metadata.get("include_llm", bool(evaluation)))
+    completed_stages = ["ppt"]
+    if transcript:
+        completed_stages.append("voice")
+    if evaluation:
+        completed_stages.append("llm")
+    if finished:
+        completed_stages.append("report")
     return {
 
         "id": str(run_dir.resolve()),
@@ -247,16 +286,31 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         "video_path": str(detection.get("video_path") or ""),
         "run_dir": str(run_dir.resolve()),
         "updated_at": updated_at,
-        "status": "completed" if evaluation else "idle",
-        "progress": 100 if evaluation else (78 if transcript else 36),
+        "status": task_status,
+        "progress": 100 if finished else (78 if transcript else 36),
         "stage": (
-            "处理完成"
-            if evaluation
-            else ("等待关联度评分" if transcript else "PPT页面识别完成")
+            "处理完成，但部分页面存在错误"
+            if completed_with_errors
+            else (
+                "处理完成"
+                if task_status == "completed"
+                else (
+                    "处理失败"
+                    if task_status == "failed"
+                    else (
+                        "等待关联度评分"
+                        if transcript
+                        else "PPT页面识别完成"
+                    )
+                )
+            )
         ),
         "elapsed_sec": elapsed,
         "model": str(evaluation.get("model") or "") if evaluation else "",
         "include_evidence": evidence_enabled,
+        "include_llm": include_llm,
+        "mode": mode,
+        "completed_stages": completed_stages,
         "summary": (
             evaluation.get("summary", {})
             if evaluation
@@ -340,8 +394,9 @@ def transcription_config(settings: Mapping[str, Any]) -> TranscriptionConfig:
             settings.get("mimo_base_url") or base.mimo_base_url
         ),
         mimo_model=str(settings.get("mimo_model") or base.mimo_model),
-        mimo_max_concurrency=int(
-            settings.get("asr_concurrency") or base.mimo_max_concurrency
+        mimo_max_concurrency=min(
+            5,
+            int(settings.get("asr_concurrency") or base.mimo_max_concurrency),
         ),
         model_download_root=str(resource_path("models/faster-whisper")),
         ffmpeg_path=bundled_tool("ffmpeg") or base.ffmpeg_path,
@@ -362,8 +417,9 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
         base,
         base_url=str(settings.get("llm_base_url") or base.base_url),
         model=str(settings.get("llm_model") or base.model),
-        max_concurrency=int(
-            settings.get("llm_concurrency") or base.max_concurrency
+        max_concurrency=min(
+            5,
+            int(settings.get("llm_concurrency") or base.max_concurrency),
         ),
         include_evidence=ev,
     )
@@ -380,17 +436,17 @@ def emit_page(
     payload = dict(page)
     # 过滤掉值为 None 的 extra 字段，避免前端收到 null 覆盖已有数据
     payload.update((k, v) for k, v in extra.items() if v is not None)
-    payload["task_id"] = task_id
     payload["status"] = status
     if "speech_text" not in payload:
         payload["speech_text"] = page_speech_text(payload)
-    emit("page.updated", page=payload)
+    emit("page.updated", task_id=task_id, page=payload)
 
 
 def run_task(payload: Mapping[str, Any]) -> None:
     started_at = time.perf_counter()
     cloud_pipeline: CloudPagePipeline | None = None
     task_id = ""
+    run_dir: Path | None = None
     try:
         video = Path(str(payload.get("video_path") or ""))
         if not video.is_file():
@@ -399,18 +455,17 @@ def run_task(payload: Mapping[str, Any]) -> None:
         if not str(output_root):
             raise ValueError("请选择结果保存目录。")
         output_root.mkdir(parents=True, exist_ok=True)
-        video_id = str(payload.get("video_id") or video.stem).strip()
-        if not video_id or any(char in video_id for char in '<>:"/\\|?*'):
-            raise ValueError("任务名称为空或包含 Windows 非法文件名字符。")
+        video_id = validate_video_id(str(payload.get("video_id") or video.stem))
         mode = str(payload.get("mode") or "full")
         settings = payload.get("settings", {})
         if not isinstance(settings, Mapping):
             raise ValueError("桌面端设置格式不正确。")
-        run_dir = output_root / video_id
+        run_dir = resolve_run_directory(output_root, video_id)
         result_path = run_dir / "result.json"
         transcript_path = run_dir / "transcript.json"
         evaluation_dir = run_dir / "llm_evaluation"
         task_id = str(run_dir.resolve())
+        include_llm = bool(settings.get("include_llm", True)) and mode == "full"
 
         emit(
             "task.started",
@@ -419,13 +474,19 @@ def run_task(payload: Mapping[str, Any]) -> None:
             video_path=str(video.resolve()),
             run_dir=str(run_dir.resolve()),
             started_at=time.time(),
-            algorithm_version="1.4.0",
+            algorithm_version="1.4.1",
             streaming_page_confirmation=True,
+            mode=mode,
+            include_llm=include_llm,
             include_evidence=bool(settings.get("include_evidence", False)),
         )
-        write_run_metadata(run_dir, time.time())
         detector = VideoPageDetector(default_detector_config(settings))
-        include_llm = bool(settings.get("include_llm", True)) and mode == "full"
+        write_run_metadata(
+            run_dir,
+            time.time(),
+            mode=mode,
+            include_llm=include_llm,
+        )
         transcribe_config = transcription_config(settings) if mode == "full" else None
         llm_settings = llm_config(settings) if include_llm else None
         asr_key = ""
@@ -507,9 +568,11 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 llm_config=llm_settings,
                 llm_api_key=llm_key,
                 progress_callback=pipeline_progress,
+                cancel_event=_cancel_event,
             )
 
         def detection_progress(message: str, progress: float | None) -> None:
+            require_not_cancelled()
             emit(
                 "task.progress",
                 task_id=task_id,
@@ -521,6 +584,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             )
 
         def page_ready(page: dict[str, Any], completed: int, total: int) -> None:
+            require_not_cancelled()
             emit_page(
                 page,
                 "transcribing" if cloud_pipeline else "detected",
@@ -567,20 +631,27 @@ def run_task(payload: Mapping[str, Any]) -> None:
             transcript, evaluation = cloud_pipeline.finish(detection)
             cloud_pipeline = None
         elif mode == "full" and transcribe_config:
-            transcript = transcribe_video_pages(
-                video,
-                result_path,
-                config=transcribe_config,
-                output_dir=run_dir,
-                api_key=str(payload.get("asr_api_key") or "") or None,
-                progress_callback=lambda message, progress: emit(
+            def transcription_progress(
+                message: str,
+                progress: float | None,
+            ) -> None:
+                require_not_cancelled()
+                emit(
                     "task.progress",
                     task_id=task_id,
                     stage="语音转写",
                     message=message,
                     progress=30 + float(progress or 0) * 45,
                     stage_progress=round(float(progress or 0) * 100),
-                ),
+                )
+
+            transcript = transcribe_video_pages(
+                video,
+                result_path,
+                config=transcribe_config,
+                output_dir=run_dir,
+                api_key=str(payload.get("asr_api_key") or "") or None,
+                progress_callback=transcription_progress,
             )
             for page in transcript.get("pages", []):
                 if isinstance(page, Mapping):
@@ -591,19 +662,27 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     )
             require_not_cancelled()
             if include_llm and llm_settings:
-                evaluation = evaluate_transcript(
-                    transcript_path,
-                    config=llm_settings,
-                    output_dir=evaluation_dir,
-                    api_key=llm_key,
-                    progress_callback=lambda message, completed, total: emit(
+                def evaluation_progress(
+                    message: str,
+                    completed: int,
+                    total: int,
+                ) -> None:
+                    require_not_cancelled()
+                    emit(
                         "task.progress",
                         task_id=task_id,
                         stage="LLM关联度评分",
                         message=f"{completed}/{total}：{message}",
                         progress=75 + completed / max(total, 1) * 25,
                         stage_progress=round(completed / max(total, 1) * 100),
-                    ),
+                    )
+
+                evaluation = evaluate_transcript(
+                    transcript_path,
+                    config=llm_settings,
+                    output_dir=evaluation_dir,
+                    api_key=llm_key,
+                    progress_callback=evaluation_progress,
                 )
                 evaluation_by_id = {
                     int(item["page_id"]): item
@@ -630,7 +709,16 @@ def run_task(payload: Mapping[str, Any]) -> None:
             meta = read_json(run_metadata_path(run_dir)) or {}
             meta["elapsed_sec"] = elapsed_sec
             meta["completed_at"] = time.time()
-            meta["status"] = "completed"
+            evaluation_summary = evaluation.get("summary", {}) if evaluation else {}
+            meta["status"] = (
+                "completed_with_errors"
+                if evaluation
+                and (
+                    int(evaluation_summary.get("failed_pages") or 0) > 0
+                    or evaluation_summary.get("complete") is False
+                )
+                else "completed"
+            )
             run_metadata_path(run_dir).write_text(
                 json.dumps(meta, ensure_ascii=False) + "\n",
                 encoding="utf-8",
@@ -647,6 +735,20 @@ def run_task(payload: Mapping[str, Any]) -> None:
     except Exception as exc:
         if cloud_pipeline is not None:
             cloud_pipeline.abort()
+        if run_dir is not None:
+            try:
+                meta = read_json(run_metadata_path(run_dir)) or {}
+                meta["elapsed_sec"] = round(time.perf_counter() - started_at, 3)
+                meta["completed_at"] = time.time()
+                meta["status"] = (
+                    "cancelled" if _cancel_event.is_set() else "failed"
+                )
+                run_metadata_path(run_dir).write_text(
+                    json.dumps(meta, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
         emit(
             "task.failed",
             task_id=task_id,
@@ -675,7 +777,15 @@ def start_task(payload: Mapping[str, Any]) -> None:
 
 def handle_command(command: Mapping[str, Any]) -> None:
     action = str(command.get("action") or "")
-    if action == "start":
+    if action == "ping":
+        emit(
+            "worker.ready",
+            project_root=str(project_root()),
+            algorithm_version="1.4.1",
+            ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
+            ffprobe_path=bundled_tool("ffprobe") or "PATH",
+        )
+    elif action == "start":
         payload = command.get("payload", {})
         if not isinstance(payload, Mapping):
             emit("task.failed", error="任务参数格式不正确。")
@@ -701,7 +811,7 @@ def main() -> int:
     emit(
         "worker.ready",
         project_root=str(project_root()),
-        algorithm_version="1.4.0",
+        algorithm_version="1.4.1",
         ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
         ffprobe_path=bundled_tool("ffprobe") or "PATH",
     )

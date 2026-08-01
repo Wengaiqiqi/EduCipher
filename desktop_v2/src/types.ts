@@ -26,7 +26,7 @@ export interface TaskRecord {
   video_path?: string;
   run_dir: string;
   updated_at?: number;
-  status: "idle" | "running" | "completed" | "failed";
+  status: "idle" | "running" | "completed" | "completed_with_errors" | "failed";
   progress?: number;
   stage?: string;
   stage_progress?: number;
@@ -39,6 +39,8 @@ export interface TaskRecord {
   message?: string;
   elapsed_sec?: number;
   model?: string;
+  mode?: "full" | "detect";
+  include_llm?: boolean;
   include_evidence?: boolean;
   summary?: {
     strict_overall_score?: number;
@@ -46,6 +48,8 @@ export interface TaskRecord {
     speech_page_coverage_percent?: number;
     total_pages?: number;
     scored_pages?: number;
+    failed_pages?: number;
+    complete?: boolean;
   };
   pages: PageRecord[];
 }
@@ -96,5 +100,7 @@ export interface WorkerEvent {
   active_cloud_requests?: number;
   cloud_limit?: number;
   algorithm_version?: string;
+  mode?: "full" | "detect";
+  include_llm?: boolean;
   include_evidence?: boolean;
 }

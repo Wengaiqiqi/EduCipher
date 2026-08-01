@@ -420,6 +420,20 @@ select:focus-visible {
   color: #07101e;
 }
 
+.stage-node.failed > span {
+  border-color: var(--red);
+  background: rgba(246, 113, 113, 0.12);
+  color: var(--red);
+}
+
+.stage-node.failed small {
+  color: var(--red);
+}
+
+.stage-node.disabled {
+  opacity: 0.5;
+}
+
 .stage-node.waiting > span {
   border-color: var(--purple);
   color: var(--purple);

@@ -323,5 +323,5 @@ python -m unittest discover -s tests -v
 归档旧方法：
 
 ```powershell
-python -m unittest discover -s legacy_ffmpeg_scene_detector/tests -v
+python -m unittest discover -s 场景阈值方法/legacy_ffmpeg_scene_detector/tests -v
 ```

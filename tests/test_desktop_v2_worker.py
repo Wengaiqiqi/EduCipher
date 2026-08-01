@@ -4,20 +4,45 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from video_page_detector.desktop_v2_worker import (
+    emit_page,
+    handle_command,
     llm_config,
     list_tasks,
     load_run_elapsed,
     load_task,
     page_speech_text,
+    transcription_config,
 )
 
 
 class DesktopV2WorkerTests(unittest.TestCase):
+    def test_page_update_emits_task_id_at_event_top_level(self) -> None:
+        with patch("video_page_detector.desktop_v2_worker.emit") as emit:
+            emit_page({"page_id": 1}, "detected", task_id="task-1")
+        emit.assert_called_once()
+        self.assertEqual(emit.call_args.args, ("page.updated",))
+        self.assertEqual(emit.call_args.kwargs["task_id"], "task-1")
+        self.assertNotIn("task_id", emit.call_args.kwargs["page"])
+
+    def test_ping_replays_worker_ready_event(self) -> None:
+        with patch("video_page_detector.desktop_v2_worker.emit") as emit:
+            handle_command({"action": "ping"})
+        self.assertEqual(emit.call_args.args, ("worker.ready",))
+        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.1")
+
     def test_detailed_evidence_setting_reaches_llm_config(self) -> None:
         self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
         self.assertFalse(llm_config({"include_evidence": False}).include_evidence)
+
+    def test_desktop_cloud_concurrency_settings_are_capped_at_five(self) -> None:
+        self.assertEqual(llm_config({"llm_concurrency": 10}).max_concurrency, 5)
+        self.assertEqual(
+            transcription_config({"asr_concurrency": 10}).mimo_max_concurrency,
+            5,
+        )
 
     def test_combines_utterance_text(self) -> None:
         text = page_speech_text(
@@ -93,6 +118,69 @@ class DesktopV2WorkerTests(unittest.TestCase):
             self.assertEqual(task["pages"][0]["speech_text"], "牛顿第二定律")
             self.assertEqual(task["pages"][0]["score"], 92)
             self.assertEqual(list_tasks(temp)[0]["video_id"], "lesson")
+
+    def test_detect_only_task_reloads_as_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "detect-only"
+            run_dir.mkdir()
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "detect-only",
+                        "pages": [{"page_id": 1, "start_sec": 0, "end_sec": 5}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "mode": "detect",
+                        "include_llm": False,
+                        "elapsed_sec": 3.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            task = load_task(run_dir)
+
+            assert task is not None
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["progress"], 100)
+            self.assertEqual(task["mode"], "detect")
+            self.assertFalse(task["include_llm"])
+
+    def test_failed_page_evaluation_reloads_as_completed_with_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "partial"
+            evaluation_dir = run_dir / "llm_evaluation"
+            evaluation_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "partial",
+                        "pages": [{"page_id": 1, "start_sec": 0, "end_sec": 5}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (evaluation_dir / "llm_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"failed_pages": 1, "complete": False},
+                        "pages": [{"page_id": 1, "status": "failed", "score": 0}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            task = load_task(run_dir)
+
+            assert task is not None
+            self.assertEqual(task["status"], "completed_with_errors")
+            self.assertEqual(task["pages"][0]["status"], "failed")
 
     def test_loads_detailed_evidence_and_infers_legacy_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

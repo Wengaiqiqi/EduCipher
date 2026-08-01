@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -19,7 +19,6 @@ import {
   History,
   Image as ImageIcon,
   LoaderCircle,
-  Maximize2,
   Menu,
   MessageSquareText,
   Minus,
@@ -27,9 +26,7 @@ import {
   PanelLeftClose,
   Play,
   Plus,
-  RotateCcw,
   Settings,
-  SlidersHorizontal,
   Sparkles,
   Square,
   Sun,
@@ -111,7 +108,11 @@ function pageImage(page?: PageRecord) {
 }
 
 function overallScore(task?: TaskRecord) {
-  return Number(task?.summary?.strict_overall_score ?? task?.summary?.association_average_score ?? 0);
+  const value = task?.summary?.strict_overall_score
+    ?? task?.summary?.association_average_score;
+  if (value == null) return undefined;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
 }
 
 function EmptySlide({ compact = false }: { compact?: boolean }) {
@@ -135,6 +136,7 @@ function SlideImage({
 }) {
   const [failed, setFailed] = useState(false);
   const source = pageImage(page);
+  useEffect(() => setFailed(false), [source]);
   if (!source || failed) return <EmptySlide compact={compact} />;
   return (
     <img
@@ -151,23 +153,29 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   const pages = task?.pages || [];
   const isRunning = task?.status === "running";
   const isComplete = task?.status === "completed";
+  const hasErrors = task?.status === "completed_with_errors";
+  const isTerminal = isComplete || hasErrors;
+  const voiceEnabled = task?.mode !== "detect";
+  const llmEnabled = voiceEnabled && task?.include_llm !== false;
 
   const transcribed = pages.filter((p) => p.status === "scoring" || p.status === "completed" || p.status === "failed").length;
   const scored = pages.filter((p) => (p.status === "completed" || p.status === "failed") && p.score != null).length;
   const totalPages = pages.length;
   const completedStages = task?.completed_stages || [];
 
-  const pptPct = isComplete ? 100 : Math.min(100, Math.max(0, task?.stage_progresses?.ppt || 0));
-  const voicePct = isComplete ? 100 : totalPages ? Math.round((transcribed / totalPages) * 100) : 0;
-  const llmPct = isComplete ? 100 : totalPages ? Math.round((scored / totalPages) * 100) : 0;
-  const stageRatio = isComplete ? 100 : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
+  const pptPct = isTerminal ? 100 : Math.min(100, Math.max(0, task?.stage_progresses?.ppt || 0));
+  const voicePct = !voiceEnabled ? 0 : isTerminal ? 100 : totalPages ? Math.round((transcribed / totalPages) * 100) : 0;
+  const llmPct = !llmEnabled ? 0 : isComplete ? 100 : totalPages ? Math.round((scored / totalPages) * 100) : 0;
+  const stageRatio = isTerminal ? 100 : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
 
   // 并发流水线会在 PPT 检测尚未结束时提前完成个别页面。
   // 阶段只有在内核明确确认 PPT 完成，且对应页面进度达到 100% 后才允许打勾。
-  const pptDone = isComplete || (completedStages.includes("ppt") && pptPct === 100);
-  const voiceDone = isComplete || (pptDone && totalPages > 0 && voicePct === 100);
-  const llmDone = isComplete || (pptDone && totalPages > 0 && llmPct === 100);
-  const reportDone = isComplete;
+  const pptDone = isTerminal || (completedStages.includes("ppt") && pptPct === 100);
+  const voiceDone = voiceEnabled && (isTerminal || (pptDone && totalPages > 0 && voicePct === 100));
+  const llmDone = llmEnabled && !hasErrors && (
+    isComplete || (pptDone && totalPages > 0 && llmPct === 100)
+  );
+  const reportDone = isTerminal;
 
   // Active states based on worker stage messages
   const pptActive = isRunning && !pptDone && (stage.includes("PPT") || stage.includes("页面") || totalPages === 0);
@@ -176,26 +184,26 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   const reportActive = isRunning && !reportDone && (stage.includes("报告") || (!pptActive && !voiceActive && !llmActive && isRunning));
 
   const stages = [
-    { label: "PPT识别",     active: pptActive,   done: pptDone,   pct: pptPct },
-    { label: "语音识别",    active: voiceActive, done: voiceDone,  pct: voicePct },
-    { label: "关联度评分",  active: llmActive,   done: llmDone,    pct: llmPct },
-    { label: "生成报告",    active: reportActive, done: reportDone, pct: isComplete ? 100 : stageRatio },
+    { label: "PPT识别", active: pptActive, done: pptDone, pct: pptPct, disabled: false, failed: false },
+    { label: "语音识别", active: voiceActive, done: voiceDone, pct: voicePct, disabled: !voiceEnabled, failed: false },
+    { label: "关联度评分", active: llmActive, done: llmDone, pct: llmPct, disabled: !llmEnabled, failed: hasErrors && llmEnabled },
+    { label: "生成报告", active: reportActive, done: reportDone, pct: isTerminal ? 100 : stageRatio, disabled: false, failed: hasErrors },
   ];
 
   return (
     <div className="stage-pipeline">
-      {stages.map(({ label, active, done, pct }) => {
-        const waiting = !done && !active && isRunning;
+      {stages.map(({ label, active, done, pct, disabled, failed }) => {
+        const waiting = !disabled && !failed && !done && !active && isRunning;
         return (
           <div className="stage-wrap" key={label}>
-            <div className={`stage-node ${done ? "done" : ""} ${active ? "active" : ""} ${waiting ? "waiting" : ""}`}>
-              <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : waiting ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
+            <div className={`stage-node ${done && !failed ? "done" : ""} ${active ? "active" : ""} ${waiting ? "waiting" : ""} ${failed ? "failed" : ""} ${disabled ? "disabled" : ""}`}>
+              <span>{failed ? <X size={15} /> : done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : waiting ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
               <div>
                 <strong>{label}</strong>
-                <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}</small>
+                <small>{disabled ? "未启用" : `${pct}%${failed ? " · 有错误" : done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}`}</small>
               </div>
             </div>
-            {label !== "生成报告" && <div className={`stage-link ${done ? "done" : ""}`} />}
+            {label !== "生成报告" && <div className={`stage-link ${done && !failed ? "done" : ""}`} />}
           </div>
         );
       })}
@@ -255,7 +263,7 @@ function PageCard({
 }
 
 function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: () => void; settings?: AppSettings }) {
-  const score = Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0);
+  const score = overallScore(task);
   const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
   const [pageIndex, setPageIndex] = useState(0);
   const evidenceEnabled = task.include_evidence ?? settings?.include_evidence ?? false;
@@ -276,7 +284,7 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
           <button className="icon-button" onClick={onClose}><X size={19} /></button>
         </div>
         <div className="report-viewer-summary">
-          <article><Gauge /><span>总关联度</span><strong>{Math.round(score) || "—"}</strong></article>
+          <article><Gauge /><span>总关联度</span><strong>{score != null ? Math.round(score) : "—"}</strong></article>
           <article><History /><span>讲话覆盖率</span><strong>{Math.round(coverage)}%</strong></article>
           <article><CheckCircle2 /><span>已完成页</span><strong>{pages.filter((p) => p.status === "completed").length}</strong></article>
           <article><FileText /><span>总页数</span><strong>{pages.length}</strong></article>
@@ -450,7 +458,7 @@ function SettingsModal({
         <div className="modal-header">
           <div>
             <h2>模型与处理设置</h2>
-            <p>API Key 会保存在本地，用于新建任务时自动填充。</p>
+            <p>API Key 仅保留在本次运行内存中，退出应用后不会保存。</p>
           </div>
           <button className="icon-button" onClick={onClose}><X size={19} /></button>
         </div>
@@ -477,18 +485,20 @@ function SettingsModal({
             {draft.asr_engine === "faster-whisper" ? (
               <label>本地模型<input value={draft.asr_model} onChange={(e) => update("asr_model", e.target.value)} /></label>
             ) : (
-              <div className="form-two-columns aligned-fields">
-                <label className="wide-field">ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
-                <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
-                <label>
-                  并发上限
-                  <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
-                    {[1,2,3,4,5,6,7,8,9,10].map((n) => <option key={n} value={n}>{n}</option>)}
-                  </select>
-                </label>
-              </div>
+              <>
+                <div className="form-two-columns aligned-fields">
+                  <label className="wide-field">ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
+                  <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
+                  <label>
+                    并发上限
+                    <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
+                    {[1,2,3,4,5].map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <label>ASR API Key<input type="password" value={draft.asr_api_key} onChange={(e) => update("asr_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
+              </>
             )}
-            <label>ASR API Key<input type="password" value={draft.asr_api_key} onChange={(e) => update("asr_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
           </section>
           <section className="wide">
             <h3><WandSparkles size={17} /> LLM 关联度评分</h3>
@@ -500,7 +510,7 @@ function SettingsModal({
               <label>
                 并发上限
                 <select value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))}>
-                  {[1,2,3,4,5,6,7,8,9,10].map((n) => <option key={n} value={n}>{n}</option>)}
+                  {[1,2,3,4,5].map((n) => <option key={n} value={n}>{n}</option>)}
                 </select>
               </label>
               <label className="wide-field">OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} /></label>
@@ -627,11 +637,11 @@ function NewTaskModal({
 }
 
 function ReportsView({ tasks, onOpenReport }: { tasks: TaskRecord[]; onOpenReport: (task: TaskRecord) => void }) {
-  const completed = tasks.filter((task) => task.status === "completed");
+  const completed = tasks.filter((task) => task.status === "completed" || task.status === "completed_with_errors");
   const scores = completed
-    .map((task) => Number(task.summary?.strict_overall_score ?? task.summary?.association_average_score ?? 0))
-    .filter(Number.isFinite);
-  const average = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+    .map((task) => overallScore(task))
+    .filter((score): score is number => score != null);
+  const average = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : undefined;
   return (
     <main className="reports-view">
       <div className="reports-heading">
@@ -640,18 +650,21 @@ function ReportsView({ tasks, onOpenReport }: { tasks: TaskRecord[]; onOpenRepor
       <div className="report-metrics">
         <article><History /><span>历史任务</span><strong>{tasks.length}</strong></article>
         <article><CheckCircle2 /><span>已完成任务</span><strong>{completed.length}</strong></article>
-        <article><Gauge /><span>平均关联度</span><strong>{Math.round(average) || "—"}</strong></article>
+        <article><Gauge /><span>平均关联度</span><strong>{average != null ? Math.round(average) : "—"}</strong></article>
       </div>
       <section className="report-list">
         <h2>最近报告</h2>
-        {completed.map((task) => (
-          <div className="report-row" key={task.id}>
-            <div className="report-icon"><FileText size={20} /></div>
-            <div><strong>{task.video_id}</strong><span>{task.pages.length} 页 PPT · {task.model || "关联度模型"}</span></div>
-            <div className="report-score">{Math.round(overallScore(task) || 0)}<small>分</small></div>
-            <button className="button secondary" onClick={() => onOpenReport(task)}>打开报告</button>
-          </div>
-        ))}
+        {completed.map((task) => {
+          const score = overallScore(task);
+          return (
+            <div className="report-row" key={task.id}>
+              <div className="report-icon"><FileText size={20} /></div>
+              <div><strong>{task.video_id}</strong><span>{task.pages.length} 页 PPT · {task.model || "关联度模型"}</span></div>
+              <div className="report-score">{score != null ? Math.round(score) : "—"}<small>分</small></div>
+              <button className="button secondary" onClick={() => onOpenReport(task)}>打开报告</button>
+            </div>
+          );
+        })}
         {!completed.length && <div className="empty-report">完成一次完整处理后，报告会显示在这里。</div>}
       </section>
     </main>
@@ -675,9 +688,6 @@ export default function App() {
   const [theme, setTheme] = useState<"dark" | "light">(
     () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "dark",
   );
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-
   const activeTask = tasks.find((task) => task.id === activeTaskId) || tasks[0];
   const selectedPage =
     activeTask?.pages.find((page) => page.page_id === selectedPageId) ||
@@ -715,16 +725,8 @@ export default function App() {
         }),
       );
     }
-    invoke<string>("project_output_dir").then((output) => {
-      const merged = { ...DEFAULT_SETTINGS, ...restored };
-      if (!merged.output_root) merged.output_root = output;
-      setSettings(merged);
-      sendWorker({ action: "list_tasks", output_root: merged.output_root });
-    }).catch((reason) => {
-      setWorkerStatus("failed");
-      setError(`无法准备结果目录：${String(reason)}`);
-    });
     let unlisten: (() => void) | undefined;
+    let disposed = false;
     listen<WorkerEvent & { tasks?: TaskRecord[] }>("worker-event", (event) => {
       const data = event.payload;
       if (data.type === "worker.ready") {
@@ -759,6 +761,8 @@ export default function App() {
           status: "running",
           progress: 0,
           stage: "准备处理",
+          mode: data.mode,
+          include_llm: data.include_llm,
           include_evidence: data.include_evidence ?? false,
           pages: [],
         };
@@ -816,10 +820,28 @@ export default function App() {
         setCloudActive(0);
         setTasks((current) => current.map((task) => (task.id === (data.task_id || task.id) && task.status === "running") ? { ...task, status: "failed", stage: "处理失败" } : task));
       }
-    }).then((dispose) => {
+    }).then(async (dispose) => {
+      if (disposed) {
+        dispose();
+        return;
+      }
       unlisten = dispose;
+      const output = await invoke<string>("project_output_dir");
+      const merged = { ...DEFAULT_SETTINGS, ...restored };
+      if (!merged.output_root) merged.output_root = output;
+      merged.asr_concurrency = Math.min(5, Math.max(1, Number(merged.asr_concurrency) || 1));
+      merged.llm_concurrency = Math.min(5, Math.max(1, Number(merged.llm_concurrency) || 1));
+      setSettings(merged);
+      await sendWorker({ action: "ping" });
+      await sendWorker({ action: "list_tasks", output_root: merged.output_root });
+    }).catch((reason) => {
+      setWorkerStatus("failed");
+      setError(`无法初始化处理引擎：${String(reason)}`);
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -853,7 +875,7 @@ export default function App() {
     }
   }
 
-  function saveSettings(value: AppSettings) {
+  async function saveSettings(value: AppSettings) {
     setSettings(value);
     localStorage.setItem(
       "kexi.settings",
@@ -864,22 +886,35 @@ export default function App() {
       }),
     );
     setShowSettings(false);
-    sendWorker({ action: "list_tasks", output_root: value.output_root });
+    try {
+      await sendWorker({ action: "list_tasks", output_root: value.output_root });
+    } catch (reason) {
+      setWorkerStatus("failed");
+      setError(`设置已保存，但无法刷新任务列表：${String(reason)}`);
+    }
   }
 
   const recentTasks = useMemo(() => tasks.filter((t) => t.pages.length > 0 || t.status === "running").slice(0, 8), [tasks]);
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${theme}`}>
-      <header className="titlebar">
+      <header
+        className="titlebar"
+        data-tauri-drag-region
+        onMouseDown={(event) => {
+          if (event.button !== 0) return;
+          if ((event.target as HTMLElement).closest("button")) return;
+          void getCurrentWindow().startDragging();
+        }}
+      >
         <div className="brand" data-tauri-drag-region>
           <img className="brand-logo" src={appLogo} alt="课析" />
           <strong>课析</strong>
         </div>
-        <button className="project-switcher">
+        <div className="project-switcher" data-tauri-drag-region>
           <span>{activeTask?.video_id || "尚未选择任务"}</span>
           <ChevronDown size={15} />
-        </button>
+        </div>
         <div className="titlebar-spacer" data-tauri-drag-region />
         <div className={`cloud-health ${workerStatus === "failed" ? "has-error" : ""}`}>
           <Cloud size={16} />
@@ -925,7 +960,11 @@ export default function App() {
               <div>
                 <strong>{task.video_id}</strong>
                 <span>
-                  {task.status === "running" ? "正在处理" : `${task.pages.length} 页`}
+                  {task.status === "running"
+                    ? "正在处理"
+                    : task.status === "completed_with_errors"
+                      ? `${task.pages.length} 页 · 存在错误`
+                      : `${task.pages.length} 页`}
                   {task.elapsed_sec != null && task.elapsed_sec > 0
                     ? ` · ${formatTime(task.elapsed_sec)}`
                     : ""}

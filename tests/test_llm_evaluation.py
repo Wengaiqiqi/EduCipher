@@ -8,6 +8,7 @@ from PIL import Image
 
 from video_page_detector.llm_evaluation import (
     LLMEvaluationConfig,
+    _page_input_fingerprint,
     build_chat_payload,
     evaluate_transcript,
     normalize_page_evaluation,
@@ -18,6 +19,29 @@ from video_page_detector.llm_evaluation import (
 
 
 class LLMEvaluationTests(unittest.TestCase):
+    def test_cache_fingerprint_changes_with_provider_and_request_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "page.jpg"
+            Image.new("RGB", (64, 36), "white").save(screenshot)
+            page = {"page_id": 1, "utterances": [{"text": "讲解内容"}]}
+            base = _page_input_fingerprint(
+                page,
+                screenshot,
+                LLMEvaluationConfig(base_url="https://provider-a.test/v1"),
+            )
+            variants = [
+                LLMEvaluationConfig(base_url="https://provider-b.test/v1"),
+                LLMEvaluationConfig(temperature=0.3),
+                LLMEvaluationConfig(image_detail="low"),
+                LLMEvaluationConfig(response_format_mode="prompt_only"),
+            ]
+            for config in variants:
+                with self.subTest(config=config):
+                    self.assertNotEqual(
+                        base,
+                        _page_input_fingerprint(page, screenshot, config),
+                    )
+
     def test_request_sends_plain_speech_without_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             screenshot = Path(directory) / "page.jpg"

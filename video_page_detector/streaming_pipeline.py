@@ -12,6 +12,7 @@ from PIL import Image
 from .analysis import crop_frame, detect_screen_crop_ratios
 from .config import DetectorConfig
 from .ffmpeg_io import FFmpegError, FFmpegTools
+from .output_paths import resolve_run_directory, validate_video_id
 from .temporal import (
     IncrementalTemporalSegmenter,
     TemporalFeature,
@@ -46,13 +47,8 @@ class VideoPageDetector:
         source = Path(video_path)
         if not source.is_file():
             raise FileNotFoundError(f"Video file does not exist: {source}")
-        identifier = video_id or source.stem
-        if not identifier or identifier in {".", ".."}:
-            raise ValueError("video_id must not be empty")
-        if "/" in identifier or "\\" in identifier:
-            raise ValueError("video_id cannot contain path separators")
-
-        run_dir = Path(output_root) / identifier
+        identifier = validate_video_id(video_id or source.stem)
+        run_dir = resolve_run_directory(output_root, identifier)
         audit_dir = run_dir / "temporal"
         audit_dir.mkdir(parents=True, exist_ok=True)
         feature_tools = FFmpegTools(

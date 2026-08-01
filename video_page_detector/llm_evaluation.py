@@ -130,8 +130,17 @@ def _page_input_fingerprint(
 ) -> str:
     digest = hashlib.sha256()
     digest.update(PROMPT_VERSION.encode("utf-8"))
-    digest.update(config.model.encode("utf-8"))
-    digest.update(str(config.include_evidence).encode("ascii"))
+    cache_config = {
+        "base_url": config.base_url.rstrip("/"),
+        "model": config.model,
+        "temperature": config.temperature,
+        "response_format_mode": config.response_format_mode,
+        "image_detail": config.image_detail,
+        "include_evidence": config.include_evidence,
+    }
+    digest.update(
+        json.dumps(cache_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
     digest.update(str(page.get("start_sec")).encode("utf-8"))
     digest.update(str(page.get("end_sec")).encode("utf-8"))
     digest.update(_page_utterance_text(page).encode("utf-8"))

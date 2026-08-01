@@ -12,7 +12,7 @@ from video_page_detector.desktop_app import (
 class DesktopAppHelperTests(unittest.TestCase):
     def test_builds_expected_workflow_paths(self) -> None:
         paths = build_workflow_paths(Path("output"), "lesson")
-        self.assertEqual(paths.run_dir, Path("output") / "lesson")
+        self.assertEqual(paths.run_dir, (Path("output") / "lesson").resolve())
         self.assertEqual(paths.result_json, paths.run_dir / "result.json")
         self.assertEqual(
             paths.transcript_json,
