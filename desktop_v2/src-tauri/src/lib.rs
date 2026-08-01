@@ -1,5 +1,4 @@
 use serde_json::{json, Value};
-use std::os::windows::process::CommandExt;
 use std::{
     env,
     io::{BufRead, BufReader, Write},
@@ -8,6 +7,8 @@ use std::{
     sync::Mutex,
     thread,
 };
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tauri::{Emitter, Manager};
 
 struct WorkerProcess {
@@ -69,8 +70,11 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<WorkerProcess, String> {
         .env("PYTHONUTF8", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000);
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x08000000);
+    }
 
     let mut child = command
         .spawn()

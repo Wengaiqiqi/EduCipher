@@ -1,7 +1,7 @@
 {
   "name": "classroom-ppt-desktop-v2",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "课析 - 课堂视频与 PPT 智能分析桌面端",
   "scripts": {
     "dev": "tauri dev",

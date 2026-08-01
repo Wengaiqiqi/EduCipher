@@ -570,7 +570,11 @@ function NewTaskModal({
       output_root: outputRoot,
       video_id: videoId.trim(),
       mode,
-      settings,
+      settings: {
+        ...settings,
+        asr_api_key: "",
+        llm_api_key: "",
+      },
       asr_api_key: settings.asr_api_key,
       llm_api_key: settings.llm_api_key,
       asr_upload_consent: true,
@@ -703,6 +707,19 @@ export default function App() {
     } catch {
       restored = {};
     }
+    // 密钥只保留在本次应用内存中，不从旧版localStorage恢复。
+    delete restored.asr_api_key;
+    delete restored.llm_api_key;
+    if (saved) {
+      localStorage.setItem(
+        "kexi.settings",
+        JSON.stringify({
+          ...restored,
+          asr_api_key: "",
+          llm_api_key: "",
+        }),
+      );
+    }
     invoke<string>("project_output_dir").then((output) => {
       const merged = { ...DEFAULT_SETTINGS, ...restored };
       if (!merged.output_root) merged.output_root = output;
@@ -752,6 +769,7 @@ export default function App() {
           status: "running",
           progress: 0,
           stage: "准备处理",
+          include_evidence: data.include_evidence ?? false,
           pages: [],
         };
         setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)]);
@@ -830,7 +848,14 @@ export default function App() {
 
   function saveSettings(value: AppSettings) {
     setSettings(value);
-    localStorage.setItem("kexi.settings", JSON.stringify(value));
+    localStorage.setItem(
+      "kexi.settings",
+      JSON.stringify({
+        ...value,
+        asr_api_key: "",
+        llm_api_key: "",
+      }),
+    );
     setShowSettings(false);
     sendWorker({ action: "list_tasks", output_root: value.output_root });
   }

@@ -89,4 +89,5 @@ export interface WorkerEvent {
   active_cloud_requests?: number;
   cloud_limit?: number;
   algorithm_version?: string;
+  include_evidence?: boolean;
 }

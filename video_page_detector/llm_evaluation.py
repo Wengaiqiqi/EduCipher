@@ -375,8 +375,9 @@ def normalize_page_evaluation(
 def _no_speech_evaluation(
     page: Mapping[str, Any],
     fingerprint: str,
+    include_evidence: bool = False,
 ) -> dict[str, Any]:
-    return {
+    result: dict[str, Any] = {
         "page_id": int(page["page_id"]),
         "start_sec": round(float(page["start_sec"]), 3),
         "end_sec": round(float(page["end_sec"]), 3),
@@ -387,13 +388,19 @@ def _no_speech_evaluation(
         "evidence_consistency": 0,
         "score": 0,
         "level": "无讲话",
-        "ppt_key_points": [],
-        "speech_key_points": [],
-        "matched_evidence": [],
-        "unrelated_content": [],
         "reason": "该页面时间段内没有识别到讲话，无法判断内容关联度。",
-        "confidence": 1.0,
     }
+    if include_evidence:
+        result.update(
+            {
+                "ppt_key_points": [],
+                "speech_key_points": [],
+                "matched_evidence": [],
+                "unrelated_content": [],
+                "confidence": 1.0,
+            }
+        )
+    return result
 
 
 async def _http_requester(
@@ -496,7 +503,7 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -631,7 +638,7 @@ async def evaluate_page_async(
     if cached is not None:
         return cached
     if not _page_utterance_text(page):
-        result = _no_speech_evaluation(page, fingerprint)
+        result = _no_speech_evaluation(page, fingerprint, include_evidence=config.include_evidence)
         _write_json(cache_path, result)
         return result
     try:
@@ -668,8 +675,9 @@ async def evaluate_page_async(
             "score": 0,
             "level": "请求失败",
             "reason": str(exc),
-            "matched_evidence": [],
         }
+        if config.include_evidence:
+            result["matched_evidence"] = []
     _write_json(cache_path, result)
     return result
 

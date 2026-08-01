@@ -265,8 +265,9 @@ class CloudPagePipeline:
                 "score": 0,
                 "level": "请求失败",
                 "reason": str(exc),
-                "matched_evidence": [],
             }
+            if self.llm_config is not None and self.llm_config.include_evidence:
+                evaluation["matched_evidence"] = []
         with self._lock:
             self._evaluations[page_id] = evaluation
             self._llm_completed += 1

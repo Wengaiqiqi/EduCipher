@@ -1,6 +1,6 @@
 [package]
 name = "kexi-desktop"
-version = "2.0.0"
+version = "2.0.1"
 description = "课析 - 课堂视频与 PPT 智能分析桌面端"
 authors = ["Kexi"]
 edition = "2021"
@@ -19,4 +19,3 @@ serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
-
