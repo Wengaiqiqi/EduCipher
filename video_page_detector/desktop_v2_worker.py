@@ -531,8 +531,6 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 task_id=task_id,
                 stage="PPT页面识别",
                 message=f"第{page['page_id']}页高清截图已确认",
-                progress=30 + completed / max(total, 1) * 28,
-                stage_progress=round(completed / max(total, 1) * 100),
                 completed=completed,
                 total=total,
             )
@@ -547,6 +545,15 @@ def run_task(payload: Mapping[str, Any]) -> None:
             page_ready_callback=page_ready,
         )
         require_not_cancelled()
+        emit(
+            "task.progress",
+            task_id=task_id,
+            stage="PPT页面识别",
+            message=f"PPT页面识别完成，共确认{len(detection.get('pages', []))}页",
+            progress=58 if mode == "full" else 100,
+            stage_progress=100,
+            completed_stage="ppt",
+        )
         transcript: dict[str, Any] | None = None
         evaluation: dict[str, Any] | None = None
         if cloud_pipeline:

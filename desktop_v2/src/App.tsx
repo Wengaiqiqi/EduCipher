@@ -46,6 +46,7 @@ import type {
   TaskRecord,
   WorkerEvent,
 } from "./types";
+import appLogo from "./assets/logo.png";
 
 const DEFAULT_SETTINGS: AppSettings = {
   output_root: "",
@@ -151,25 +152,25 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   const isRunning = task?.status === "running";
   const isComplete = task?.status === "completed";
 
-  const detected = pages.filter((p) => p.status !== "waiting").length;
-  const transcribed = pages.filter((p) => p.status === "scoring" || p.status === "completed").length;
-  const scored = pages.filter((p) => p.status === "completed" && p.score != null).length;
-  const totalPages = Math.max(pages.length, 1);
+  const transcribed = pages.filter((p) => p.status === "scoring" || p.status === "completed" || p.status === "failed").length;
+  const scored = pages.filter((p) => (p.status === "completed" || p.status === "failed") && p.score != null).length;
+  const totalPages = pages.length;
+  const completedStages = task?.completed_stages || [];
 
-  const pptPct = Math.round((detected / totalPages) * 100);
-  const voicePct = pages.length ? Math.round((transcribed / totalPages) * 100) : 0;
-  const llmPct = pages.length ? Math.round((scored / totalPages) * 100) : 0;
+  const pptPct = isComplete ? 100 : Math.min(100, Math.max(0, task?.stage_progresses?.ppt || 0));
+  const voicePct = isComplete ? 100 : totalPages ? Math.round((transcribed / totalPages) * 100) : 0;
+  const llmPct = isComplete ? 100 : totalPages ? Math.round((scored / totalPages) * 100) : 0;
   const stageRatio = isComplete ? 100 : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
 
-  // pptDone: 基于 worker 阶段而非 pages.length，避免第一页到达时误判为已完成
-  // 关键：stage="准备处理" 时即使 detected>0 也不能算完成（page.updated 先于 task.progress 到达）
-  const pptDone = isComplete || (detected > 0 && (!isRunning || (stage !== "准备处理" && stage !== "" && !stage.includes("PPT"))));
-  const voiceDone = isComplete || (detected > 0 && transcribed === detected);
-  const llmDone = isComplete || (scored > 0 && (!isRunning || (stage !== "准备处理" && stage !== "" && !stage.includes("LLM"))));
+  // 并发流水线会在 PPT 检测尚未结束时提前完成个别页面。
+  // 阶段只有在内核明确确认 PPT 完成，且对应页面进度达到 100% 后才允许打勾。
+  const pptDone = isComplete || (completedStages.includes("ppt") && pptPct === 100);
+  const voiceDone = isComplete || (pptDone && totalPages > 0 && voicePct === 100);
+  const llmDone = isComplete || (pptDone && totalPages > 0 && llmPct === 100);
   const reportDone = isComplete;
 
   // Active states based on worker stage messages
-  const pptActive = isRunning && !pptDone && (stage.includes("PPT") || stage.includes("页面") || detected === 0);
+  const pptActive = isRunning && !pptDone && (stage.includes("PPT") || stage.includes("页面") || totalPages === 0);
   const voiceActive = isRunning && !voiceDone && (stage.includes("语音") || stage.includes("转写") || stage.includes("云端"));
   const llmActive = isRunning && !llmDone && (stage.includes("LLM") || stage.includes("评分"));
   const reportActive = isRunning && !reportDone && (stage.includes("报告") || (!pptActive && !voiceActive && !llmActive && isRunning));
@@ -184,7 +185,6 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   return (
     <div className="stage-pipeline">
       {stages.map(({ label, active, done, pct }) => {
-        const isPpt = label === "PPT识别";
         const waiting = !done && !active && isRunning;
         return (
           <div className="stage-wrap" key={label}>
@@ -192,11 +192,7 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
               <span>{done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : waiting ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
               <div>
                 <strong>{label}</strong>
-                {isPpt ? (
-                  <small>{done ? "已完成" : active ? "进行中" : waiting ? "等待中" : ""}</small>
-                ) : (
-                  <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}</small>
-                )}
+                <small>{pct}%{done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}</small>
               </div>
             </div>
             {label !== "生成报告" && <div className={`stage-link ${done ? "done" : ""}`} />}
@@ -676,7 +672,6 @@ export default function App() {
   const [error, setError] = useState("");
   const [workerStatus, setWorkerStatus] = useState<"starting" | "ready" | "failed">("starting");
   const [algorithmVersion, setAlgorithmVersion] = useState("");
-  const [workerLogs, setWorkerLogs] = useState<string[]>([]);
   const [theme, setTheme] = useState<"dark" | "light">(
     () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "dark",
   );
@@ -735,11 +730,6 @@ export default function App() {
       if (data.type === "worker.ready") {
         setWorkerStatus("ready");
         setAlgorithmVersion(data.algorithm_version || "");
-        setWorkerLogs([]);
-        return;
-      }
-      if (data.type === "worker.log") {
-        setWorkerLogs((prev) => [...prev.slice(-19), data.message || ""]);
         return;
       }
       if (data.type === "worker.error" || data.type === "worker.exited") {
@@ -779,9 +769,26 @@ export default function App() {
       } else if (data.type === "task.progress") {
         setTasks((current) =>
           current.map((task) =>
-            task.id === (data.task_id || activeTaskId)
-              ? { ...task, status: "running", progress: data.progress, stage: data.stage, stage_progress: data.stage_progress, message: data.message }
-              : task,
+            task.id === (data.task_id || activeTaskId) ? (() => {
+              const stageProgresses = { ...task.stage_progresses };
+              if (data.stage_progress != null) {
+                if (data.stage?.includes("PPT") || data.stage?.includes("页面识别")) stageProgresses.ppt = data.stage_progress;
+                else if (data.stage?.includes("语音") || data.stage?.includes("转写")) stageProgresses.voice = data.stage_progress;
+                else if (data.stage?.includes("LLM") || data.stage?.includes("评分")) stageProgresses.llm = data.stage_progress;
+              }
+              const completedStages = [...(task.completed_stages || [])];
+              if (data.completed_stage && !completedStages.includes(data.completed_stage)) completedStages.push(data.completed_stage);
+              return {
+                ...task,
+                status: "running" as const,
+                progress: data.progress ?? task.progress,
+                stage: data.stage,
+                stage_progress: data.stage_progress ?? task.stage_progress,
+                stage_progresses: stageProgresses,
+                completed_stages: completedStages,
+                message: data.message,
+              };
+            })() : task,
           ),
         );
         if (data.stage?.includes("语音")) setCloudActive((value) => Math.max(1, value));
@@ -866,7 +873,7 @@ export default function App() {
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${theme}`}>
       <header className="titlebar">
         <div className="brand" data-tauri-drag-region>
-          <div className="brand-mark"><span /><span /></div>
+          <img className="brand-logo" src={appLogo} alt="课析" />
           <strong>课析</strong>
         </div>
         <button className="project-switcher">
@@ -874,12 +881,12 @@ export default function App() {
           <ChevronDown size={15} />
         </button>
         <div className="titlebar-spacer" data-tauri-drag-region />
-        <div className={`cloud-health ${workerStatus === "failed" ? "has-error" : ""}`} title={workerLogs.slice(-3).join("\n")}>
+        <div className={`cloud-health ${workerStatus === "failed" ? "has-error" : ""}`}>
           <Cloud size={16} />
           {workerStatus === "ready"
             ? `处理引擎正常${algorithmVersion ? ` · 内核 ${algorithmVersion}` : ""}`
             : workerStatus === "failed"
-              ? `处理引擎异常${workerLogs.length ? ` · ${workerLogs[workerLogs.length-1].slice(0,60)}` : ""}`
+              ? "处理引擎异常"
               : "正在连接处理引擎"}
         </div>
         <div className="window-actions">

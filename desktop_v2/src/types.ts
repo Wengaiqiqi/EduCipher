@@ -30,6 +30,12 @@ export interface TaskRecord {
   progress?: number;
   stage?: string;
   stage_progress?: number;
+  stage_progresses?: {
+    ppt?: number;
+    voice?: number;
+    llm?: number;
+  };
+  completed_stages?: Array<"ppt" | "voice" | "llm" | "report">;
   message?: string;
   elapsed_sec?: number;
   model?: string;
@@ -80,6 +86,7 @@ export interface WorkerEvent {
   message?: string;
   progress?: number;
   stage_progress?: number;
+  completed_stage?: "ppt" | "voice" | "llm" | "report";
   page?: PageRecord;
   pages?: PageRecord[];
   result?: TaskRecord;

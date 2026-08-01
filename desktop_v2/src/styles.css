@@ -93,32 +93,12 @@ select:focus-visible {
   letter-spacing: 0.04em;
 }
 
-.brand-mark {
-  position: relative;
+.brand-logo {
   width: 27px;
   height: 27px;
   border-radius: 7px;
-  background: linear-gradient(145deg, #3f86ff, #8667ed);
-  box-shadow: 0 6px 18px rgba(65, 123, 255, 0.24);
-  overflow: hidden;
-}
-
-.brand-mark span {
-  position: absolute;
-  width: 13px;
-  height: 8px;
-  border-radius: 2px;
-  background: #0e1116;
-}
-
-.brand-mark span:first-child {
-  left: -2px;
-  top: 6px;
-}
-
-.brand-mark span:last-child {
-  right: -2px;
-  bottom: 6px;
+  object-fit: cover;
+  box-shadow: 0 5px 16px rgba(15, 23, 42, 0.2);
 }
 
 .project-switcher {
@@ -878,7 +858,7 @@ select:focus-visible {
 .score-section h3,
 .reason-section h3 {
   margin: 0 0 17px;
-  color: #d2d8e2;
+  color: var(--text);
   font-size: 14px;
 }
 
@@ -1782,9 +1762,17 @@ select:focus-visible {
 .light .empty-slide-title { color: #6d28d9; }
 .light .stage-node > span { border-color: #94a3b8; color: #64748b; }
 .light .stage-node.done > span { color: #fff; }
+.light .stage-node strong,
+.light .score-section h3,
+.light .reason-section h3 { color: var(--text); }
 .light .stage-link { background: #cbd5e1; }
 .light .score-line { background: #dbe4ee; }
 .light .report-score { color: var(--green); }
+.light .report-icon {
+  border: 1px solid #dbeafe;
+  background: #eff6ff;
+  color: #2563eb;
+}
 .light .cloud-health,
 .light .window-actions button,
 .light .brand strong,
@@ -1974,4 +1962,3 @@ select:focus-visible {
 .light .recent-list button:hover {
   background: #f8fafc;
 }
-
