@@ -72,7 +72,7 @@ class _FakeFFmpegTools:
         *,
         analysis_width: int,
         analysis_height: int,
-        **_: object,
+        **_options: object,
     ) -> None:
         rng = np.random.default_rng(44)
         shape = (analysis_height, analysis_width, 3)
@@ -88,6 +88,7 @@ class _FakeFFmpegTools:
         *,
         threshold: float,
         crop_ratios: tuple[float, float, float, float] | None = None,
+        **_options: object,
     ) -> list[float]:
         self.last_threshold = threshold
         self.last_crop_ratios = crop_ratios
@@ -119,6 +120,7 @@ class _FallbackFFmpegTools(_FakeFFmpegTools):
         *,
         threshold: float,
         crop_ratios: tuple[float, float, float, float] | None = None,
+        **_options: object,
     ) -> list[float]:
         self.__class__.thresholds.append(threshold)
         return [10.0] if threshold <= 0.05 else []

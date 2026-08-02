@@ -25,6 +25,7 @@ from .transcription import (
 
 PipelineProgressCallback = Callable[[str, str, int, int], None]
 CloudActivityCallback = Callable[[int, int], None]
+PageActivityCallback = Callable[[Mapping[str, Any], str], None]
 PageASRRunner = Callable[
     [Mapping[str, Any]],
     tuple[dict[str, Any], dict[str, Any]],
@@ -58,6 +59,7 @@ class CloudPagePipeline:
         llm_api_key: str | None = None,
         progress_callback: PipelineProgressCallback | None = None,
         cloud_activity_callback: CloudActivityCallback | None = None,
+        page_activity_callback: PageActivityCallback | None = None,
         asr_runner: PageASRRunner | None = None,
         llm_runner: PageLLMRunner | None = None,
         cancel_event: threading.Event | None = None,
@@ -81,6 +83,7 @@ class CloudPagePipeline:
         self.llm_api_key = llm_api_key or ""
         self.progress_callback = progress_callback
         self.cloud_activity_callback = cloud_activity_callback
+        self.page_activity_callback = page_activity_callback
         self._asr_runner = asr_runner
         self._llm_runner = llm_runner
         self._cancel_event = cancel_event
@@ -165,6 +168,14 @@ class CloudPagePipeline:
         if self.cloud_activity_callback is not None:
             self.cloud_activity_callback(active, self._cloud_concurrency_limit)
 
+    def _report_page_activity(
+        self,
+        page: Mapping[str, Any],
+        status: str,
+    ) -> None:
+        if self.page_activity_callback is not None:
+            self.page_activity_callback(page, status)
+
     @contextmanager
     def _cloud_request(self):
         self._cloud_slots.acquire()
@@ -228,6 +239,7 @@ class CloudPagePipeline:
         self._raise_if_cancelled()
         with self._cloud_request():
             self._raise_if_cancelled()
+            self._report_page_activity(page, "transcribing")
             if self._asr_runner is not None:
                 return self._asr_runner(page)
             config = self.transcription_config
@@ -315,6 +327,7 @@ class CloudPagePipeline:
         self._raise_if_cancelled()
         with self._cloud_request():
             self._raise_if_cancelled()
+            self._report_page_activity(page, "scoring")
             if self._llm_runner is not None:
                 return self._llm_runner(page)
             assert self.llm_config is not None

@@ -1,5 +1,7 @@
 export type PageStatus =
   | "waiting"
+  | "cloud_waiting"
+  | "retry_waiting"
   | "detected"
   | "transcribing"
   | "scoring"
@@ -43,6 +45,10 @@ export interface TaskRecord {
   mode?: "full" | "detect";
   include_llm?: boolean;
   include_evidence?: boolean;
+  retry_queued?: boolean;
+  retry_page_ids?: number[];
+  retry_asr_concurrency?: number;
+  retry_llm_concurrency?: number;
   summary?: {
     strict_overall_score?: number;
     association_average_score?: number;
@@ -57,7 +63,7 @@ export interface TaskRecord {
 
 export interface AppSettings {
   output_root: string;
-  detector_preset: "precise" | "fast";
+  detector_algorithm: "temporal" | "scene-threshold";
   asr_engine: "mimo-cloud" | "faster-whisper";
   asr_model: string;
   asr_api_key: string;
@@ -102,6 +108,11 @@ export interface WorkerEvent {
   active_cloud_requests?: number;
   cloud_limit?: number;
   algorithm_version?: string;
+  detector_algorithm?: AppSettings["detector_algorithm"];
+  asr_concurrency?: number;
+  llm_concurrency?: number;
+  asr_active_requests?: number;
+  llm_active_requests?: number;
   mode?: "full" | "detect";
   include_llm?: boolean;
   include_evidence?: boolean;

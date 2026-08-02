@@ -102,6 +102,50 @@ class CloudPagePipelineTests(unittest.TestCase):
                 3,
             )
 
+    def test_page_activity_only_marks_requests_when_they_really_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+            release = threading.Event()
+            first_started = threading.Event()
+            activity: list[tuple[int, str]] = []
+
+            def asr_runner(page: dict) -> tuple[dict, dict]:
+                first_started.set()
+                release.wait(timeout=3)
+                return {**page, "utterances": []}, {}
+
+            pipeline = CloudPagePipeline(
+                video_path=video,
+                result_path=root / "result.json",
+                output_dir=root,
+                transcription_config=TranscriptionConfig(
+                    engine="mimo-cloud",
+                    mimo_max_concurrency=1,
+                ),
+                asr_api_key="",
+                asr_runner=asr_runner,
+                page_activity_callback=lambda page, status: activity.append(
+                    (int(page["page_id"]), status)
+                ),
+            )
+            pages = [
+                {"page_id": page_id, "start_sec": page_id - 1, "end_sec": page_id}
+                for page_id in range(1, 3)
+            ]
+            for page_id, page in enumerate(pages, start=1):
+                pipeline.submit_page(page, page_id, len(pages))
+
+            self.assertTrue(first_started.wait(timeout=1))
+            self.assertEqual(activity, [(1, "transcribing")])
+            release.set()
+            pipeline.finish({"video_id": "lesson", "pages": pages})
+            self.assertEqual(
+                activity,
+                [(1, "transcribing"), (2, "transcribing")],
+            )
+
     def test_abort_does_not_wait_for_running_cloud_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

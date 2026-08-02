@@ -49,9 +49,9 @@ import appLogo from "./assets/logo.png";
 
 const DEFAULT_SETTINGS: AppSettings = {
   output_root: "",
-  detector_preset: "precise",
+  detector_algorithm: "temporal",
   asr_engine: "mimo-cloud",
-  asr_model: "small",
+  asr_model: "",
   asr_api_key: "",
   llm_api_key: "",
   mimo_base_url: "https://api.xiaomimimo.com/v1",
@@ -113,6 +113,8 @@ function scoreLevel(score?: number) {
 function statusLabel(status?: PageRecord["status"]) {
   return {
     waiting: "等待处理",
+    cloud_waiting: "等待云端处理",
+    retry_waiting: "等待重试",
     detected: "页面已确认",
     transcribing: "语音识别中",
     scoring: "正在评分",
@@ -127,7 +129,28 @@ function statusIcon(status?: PageRecord["status"]) {
   if (status === "transcribing") return <Activity size={15} />;
   if (status === "scoring") return <Sparkles size={15} />;
   if (status === "detected") return <Check size={15} />;
+  if (status === "retry_waiting" || status === "cloud_waiting") return <Timer size={15} />;
   return <Timer size={15} />;
+}
+
+function markTaskInterrupted(task: TaskRecord, message: string): TaskRecord {
+  return {
+    ...task,
+    status: "failed",
+    stage: "处理失败",
+    message,
+    pages: task.mode === "detect"
+      ? task.pages
+      : task.pages.map((page) => {
+        if (page.status === "completed" || page.status === "failed") return page;
+        return {
+          ...page,
+          status: "failed" as const,
+          failure_stage: page.status === "scoring" ? "llm" as const : "asr" as const,
+          reason: page.reason || message,
+        };
+      }),
+  };
 }
 
 function pageImage(page?: PageRecord) {
@@ -242,13 +265,25 @@ function PageCard({
   page,
   selected,
   onClick,
+  onRetryPage,
+  retryQueued = false,
 }: {
   page: PageRecord;
   selected: boolean;
   onClick: () => void;
+  onRetryPage?: (page: PageRecord) => void;
+  retryQueued?: boolean;
 }) {
   return (
-    <button className={`page-card ${selected ? "selected" : ""}`} onClick={onClick}>
+    <div
+      className={`page-card ${selected ? "selected" : ""}`}
+      role="button"
+      tabIndex={0}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") onClick();
+      }}
+    >
       <div className="page-thumb">
         <SlideImage page={page} compact />
       </div>
@@ -272,6 +307,17 @@ function PageCard({
           {statusIcon(page.status)}
           {statusLabel(page.status)}
         </span>
+        {page.status === "failed" && onRetryPage && (
+          <button
+            className="button retry-button page-card-retry"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRetryPage(page);
+            }}
+          >
+            <RotateCcw size={14} />{retryQueued ? "已排队" : "单页重试"}
+          </button>
+        )}
         {page.score != null ? (
           <div className="score-badge">
             <strong>{Math.round(page.score)}</strong>
@@ -285,7 +331,7 @@ function PageCard({
           <div className="spinner-ring" />
         ) : null}
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -478,10 +524,13 @@ function Inspector({
               <p>该页面没有匹配到对应证据。</p>
             </div>
           )}
-          {page?.status === "failed" && task?.status !== "running" && onRetryPage && (
+          {page?.status === "failed" && onRetryPage && (
             <button className="button retry-button inspector-retry" onClick={() => onRetryPage(page)}>
               <RotateCcw size={16} />
-              {page.failure_stage === "asr" ? "重试本页语音识别" : "重试本页关联度评分"}
+              {task?.retry_page_ids?.includes(page.page_id)
+                || (task?.retry_queued && !(task.retry_page_ids?.length))
+                ? "本页重试已排队"
+                : page.failure_stage === "asr" ? "重试本页语音识别" : "重试本页关联度评分"}
             </button>
           )}
         </section>
@@ -500,8 +549,27 @@ function SettingsModal({
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState(settings);
+  const [settingsError, setSettingsError] = useState("");
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
     setDraft((current) => normalizeCloudConcurrency({ ...current, [key]: value }));
+  async function chooseLocalModelDirectory() {
+    const value = await open({
+      directory: true,
+      multiple: false,
+      title: "选择 faster-whisper 模型权重文件夹",
+    });
+    if (typeof value === "string") {
+      update("asr_model", value);
+      setSettingsError("");
+    }
+  }
+  function save() {
+    if (draft.asr_engine === "faster-whisper" && !draft.asr_model.trim()) {
+      setSettingsError("请选择包含 model.bin 的 faster-whisper 模型权重文件夹。");
+      return;
+    }
+    onSave(draft);
+  }
   const asrConcurrencyMax = draft.include_llm
     ? MAX_SHARED_CLOUD_REQUESTS - 1
     : MAX_SHARED_CLOUD_REQUESTS;
@@ -522,10 +590,10 @@ function SettingsModal({
           <section>
             <h3><Video size={17} /> PPT 页面识别</h3>
             <label>
-              处理精度
-              <select value={draft.detector_preset} onChange={(e) => update("detector_preset", e.target.value as "precise" | "fast")}>
-                <option value="precise">智能精准（推荐）</option>
-                <option value="fast">快速预览</option>
+              识别算法
+              <select value={draft.detector_algorithm} onChange={(e) => update("detector_algorithm", e.target.value as AppSettings["detector_algorithm"])}>
+                <option value="temporal">智能时序算法（推荐）</option>
+                <option value="scene-threshold">场景阈值算法（FFmpeg）</option>
               </select>
             </label>
           </section>
@@ -539,7 +607,14 @@ function SettingsModal({
               </select>
             </label>
             {draft.asr_engine === "faster-whisper" ? (
-              <label>本地模型<input value={draft.asr_model} onChange={(e) => update("asr_model", e.target.value)} /></label>
+              <label>
+                本地模型权重文件夹
+                <button type="button" className="path-picker" onClick={chooseLocalModelDirectory}>
+                  <FolderOpen size={17} />
+                  <span>{draft.asr_model || "选择包含 model.bin 的模型文件夹"}</span>
+                  <ChevronDown size={16} />
+                </button>
+              </label>
             ) : (
               <>
                 <div className="form-two-columns aligned-fields">
@@ -580,10 +655,11 @@ function SettingsModal({
             </label>
             <label>LLM API Key<input type="password" value={draft.llm_api_key} onChange={(e) => update("llm_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
           </section>
+          {settingsError && <div className="form-error settings-error"><XCircle size={16} />{settingsError}</div>}
         </div>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>取消</button>
-          <button className="button primary" onClick={() => onSave(draft)}>保存设置</button>
+          <button className="button primary" onClick={save}>保存设置</button>
         </div>
       </div>
     </div>
@@ -782,7 +858,7 @@ export default function App() {
       return;
     }
     const saved = localStorage.getItem("kexi.settings");
-    let restored: Partial<AppSettings> = {};
+    let restored: Partial<AppSettings> & { detector_preset?: string } = {};
     try {
       restored = saved ? JSON.parse(saved) : {};
     } catch {
@@ -791,6 +867,13 @@ export default function App() {
     // 密钥只保留在本次应用内存中，不从旧版localStorage恢复。
     delete restored.asr_api_key;
     delete restored.llm_api_key;
+    // 旧版本的“处理精度”不再参与算法选择，统一迁移到当前时序算法。
+    if (!restored.detector_algorithm) restored.detector_algorithm = "temporal";
+    delete restored.detector_preset;
+    // 旧版允许填写 small/medium 等模型名称；新版只接受用户选择的本地权重目录。
+    if (/^(tiny|base|small|medium|large(?:-v[123])?)$/i.test(restored.asr_model || "")) {
+      restored.asr_model = "";
+    }
     if (saved) {
       localStorage.setItem(
         "kexi.settings",
@@ -817,14 +900,21 @@ export default function App() {
         setCloudActive(0);
         setTasks((current) => current.map((task) =>
           task.status === "running"
-            ? { ...task, status: "failed", stage: "处理引擎异常", message }
+            ? markTaskInterrupted(task, message)
             : task,
         ));
         return;
       }
       if (data.type === "tasks.list" && data.tasks) {
         const filtered = data.tasks.filter((t) => t.pages.length > 0 || t.status === "running");
-        setTasks(filtered);
+        setTasks((current) => {
+          const running = current.filter((task) => task.status === "running");
+          const runningIds = new Set(running.map((task) => task.id));
+          return [
+            ...running,
+            ...filtered.filter((task) => !runningIds.has(task.id)),
+          ];
+        });
         setActiveTaskId((current) => current || filtered[0]?.id || "");
         return;
       }
@@ -848,7 +938,14 @@ export default function App() {
         setSelectedPageId(null);
         setError("");
       } else if (data.type === "cloud.activity") {
-        setCloudActive(Math.max(0, Number(data.active_cloud_requests) || 0));
+        const retryBreakdown =
+          data.asr_active_requests != null || data.llm_active_requests != null;
+        setCloudActive(Math.max(
+          0,
+          retryBreakdown
+            ? (Number(data.asr_active_requests) || 0) + (Number(data.llm_active_requests) || 0)
+            : Number(data.active_cloud_requests) || 0,
+        ));
       } else if (data.type === "task.progress") {
         setTasks((current) =>
           current.map((task) =>
@@ -884,7 +981,7 @@ export default function App() {
               ? task.pages.map((page) => {
                 if (page.page_id !== data.page!.page_id) return page;
                 const merged = { ...page, ...data.page };
-                if (data.page!.status === "scoring" || data.page!.status === "completed") {
+                if (["cloud_waiting", "transcribing", "scoring", "completed"].includes(data.page!.status || "")) {
                   delete merged.failure_stage;
                 }
                 return merged;
@@ -900,21 +997,41 @@ export default function App() {
         setActiveTaskId(result.id);
         setCloudActive(0);
       } else if (data.type === "task.failed") {
-        setError(data.error || "任务处理失败。");
+        const message = data.error || "任务处理失败。";
+        setError(message);
         setCloudActive(0);
-        setTasks((current) => current.map((task) => (task.id === (data.task_id || task.id) && task.status === "running") ? { ...task, status: "failed", stage: "处理失败" } : task));
+        setTasks((current) => current.map((task) =>
+          task.id === (data.task_id || task.id) && task.status === "running"
+            ? markTaskInterrupted(task, message)
+            : task,
+        ));
       } else if (data.type === "task.retry_started") {
         const retryIds = new Set(data.page_ids || []);
         setError("");
         setTasks((current) => current.map((task) => task.id === data.task_id ? {
           ...task,
           status: "running",
+          retry_queued: false,
+          retry_page_ids: [],
+          retry_asr_concurrency: data.asr_concurrency,
+          retry_llm_concurrency: data.llm_concurrency,
           stage: "正在重试失败页",
-          message: `正在重试 ${retryIds.size} 个失败页`,
+          message: [
+            `正在重试 ${retryIds.size} 个失败页`,
+            data.asr_concurrency ? `ASR 并发 ${data.asr_concurrency}` : "",
+            data.llm_concurrency ? `LLM 并发 ${data.llm_concurrency}` : "",
+          ].filter(Boolean).join(" · "),
           pages: task.pages.map((page) => retryIds.has(page.page_id) ? {
             ...page,
-            status: page.failure_stage === "asr" ? "transcribing" : "scoring",
+            status: "retry_waiting",
           } : page),
+        } : task));
+      } else if (data.type === "task.retry_queued") {
+        const queuedIds = data.page_ids || [];
+        setTasks((current) => current.map((task) => task.id === data.task_id ? {
+          ...task,
+          retry_queued: true,
+          retry_page_ids: Array.from(new Set([...(task.retry_page_ids || []), ...queuedIds])),
         } : task));
       } else if (data.type === "task.retry_completed" && data.result) {
         const result = data.result;
@@ -1004,12 +1121,6 @@ export default function App() {
       }),
     );
     setShowSettings(false);
-    try {
-      await sendWorker({ action: "list_tasks", output_root: normalized.output_root });
-    } catch (reason) {
-      setWorkerStatus("failed");
-      setError(`设置已保存，但无法刷新任务列表：${String(reason)}`);
-    }
   }
 
   async function deleteTask(task: TaskRecord) {
@@ -1035,10 +1146,6 @@ export default function App() {
   }
 
   async function retryFailedPages(task: TaskRecord, pageIds?: number[]) {
-    if (tasks.some((item) => item.status === "running")) {
-      setError("已有任务正在处理，请完成后再重试失败页。");
-      return;
-    }
     const failed = task.pages.filter((page) => page.status === "failed");
     const selected = pageIds?.length
       ? failed.filter((page) => pageIds.includes(page.page_id))
@@ -1047,17 +1154,6 @@ export default function App() {
       setError("没有找到可重试的失败页面。");
       return;
     }
-    const asrCount = selected.filter((page) => page.failure_stage === "asr").length;
-    const llmCount = selected.length - asrCount;
-    const description = [
-      asrCount ? `${asrCount} 页语音识别` : "",
-      llmCount ? `${llmCount} 页关联度评分` : "",
-    ].filter(Boolean).join("、");
-    const confirmed = await confirmDialog(
-      `将重试${description}。重试时只会重新发送这些失败页所需的音频、PPT 截图和转写内容，是否继续？`,
-      { title: "重试失败页", kind: "warning", okLabel: "继续重试", cancelLabel: "取消" },
-    );
-    if (!confirmed) return;
     setError("");
     setNav("tasks");
     setActiveTaskId(task.id);
@@ -1066,6 +1162,7 @@ export default function App() {
         action: "retry_failed_pages",
         payload: {
           task_id: task.id,
+          video_path: task.video_path || "",
           output_root: settings.output_root,
           page_ids: pageIds,
           settings,
@@ -1225,9 +1322,9 @@ export default function App() {
                     <Activity size={16} />
                     <span>{activeTask.message || activeTask.stage || "已加载历史处理结果"}</span>
                   </div>
-                  {failedPages > 0 && activeTask.status !== "running" && (
+                  {failedPages > 0 && (
                     <button className="retry-button" onClick={() => void retryFailedPages(activeTask)}>
-                      <RotateCcw size={15} />一键重试 {failedPages} 个失败页
+                      <RotateCcw size={15} />{activeTask.retry_queued ? "重试已排队" : `一键重试 ${failedPages} 个失败页`}
                     </button>
                   )}
                 </div>
@@ -1239,6 +1336,11 @@ export default function App() {
                       page={page}
                       selected={page.page_id === selectedPage?.page_id}
                       onClick={() => setSelectedPageId(page.page_id)}
+                      onRetryPage={(failedPage) => void retryFailedPages(activeTask, [failedPage.page_id])}
+                      retryQueued={Boolean(
+                        activeTask.retry_page_ids?.includes(page.page_id)
+                        || (activeTask.retry_queued && !(activeTask.retry_page_ids?.length)),
+                      )}
                     />
                   ))}
                   {activeTask.status === "running" && !activeTask.pages.length && (

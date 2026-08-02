@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 from video_page_detector.desktop_v2_worker import (
     delete_task_result,
+    detector_algorithm,
+    discover_original_video,
     emit_page,
     handle_command,
     llm_config,
@@ -16,6 +19,8 @@ from video_page_detector.desktop_v2_worker import (
     load_task,
     page_speech_text,
     run_retry_failed_pages,
+    scene_threshold_detector_config,
+    start_retry_failed_pages,
     transcription_config,
 )
 
@@ -33,7 +38,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
         with patch("video_page_detector.desktop_v2_worker.emit") as emit:
             handle_command({"action": "ping"})
         self.assertEqual(emit.call_args.args, ("worker.ready",))
-        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.3")
+        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.9")
 
     def test_detailed_evidence_setting_reaches_llm_config(self) -> None:
         self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
@@ -45,6 +50,282 @@ class DesktopV2WorkerTests(unittest.TestCase):
             transcription_config({"asr_concurrency": 10}).mimo_max_concurrency,
             10,
         )
+
+    def test_desktop_detector_algorithm_selection(self) -> None:
+        self.assertEqual(detector_algorithm({}), "temporal")
+        self.assertEqual(
+            detector_algorithm({"detector_algorithm": "scene-threshold"}),
+            "scene-threshold",
+        )
+        with self.assertRaisesRegex(ValueError, "不支持"):
+            detector_algorithm({"detector_algorithm": "unknown"})
+        scene_threshold_detector_config().validate()
+
+    def test_local_asr_uses_selected_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            model_dir = Path(temp) / "faster-whisper-model"
+            model_dir.mkdir()
+            (model_dir / "model.bin").write_bytes(b"weights")
+
+            config = transcription_config(
+                {
+                    "asr_engine": "faster-whisper",
+                    "asr_model": str(model_dir),
+                }
+            )
+
+            self.assertEqual(config.model, str(model_dir.resolve()))
+
+    def test_local_asr_rejects_incomplete_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, "model.bin"):
+                transcription_config(
+                    {
+                        "asr_engine": "faster-whisper",
+                        "asr_model": temp,
+                    }
+                )
+
+    def test_discovers_legacy_task_video_without_file_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            nested = Path(temp) / "course" / "videos"
+            nested.mkdir(parents=True)
+            video = nested / "lesson-42.mp4"
+            video.write_bytes(b"video")
+
+            discovered = discover_original_video(
+                "lesson-42",
+                search_roots=[Path(temp)],
+            )
+
+            self.assertEqual(discovered, video.resolve())
+
+    def test_retry_is_queued_while_main_task_is_running(self) -> None:
+        payload = {"task_id": "task-1", "page_ids": [2]}
+        with (
+            patch("video_page_detector.desktop_v2_worker._active_thread") as active,
+            patch("video_page_detector.desktop_v2_worker._pending_retry_payload", None),
+            patch("video_page_detector.desktop_v2_worker.emit") as emit,
+        ):
+            active.is_alive.return_value = True
+
+            start_retry_failed_pages(payload)
+
+        emit.assert_called_once_with(
+            "task.retry_queued",
+            task_id="task-1",
+            page_ids=[2],
+            message="当前主流程仍在处理，失败页重试已加入队列。",
+        )
+
+    def test_llm_retry_uses_configured_five_way_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "retry-concurrency"
+            evaluation_dir = run_dir / "llm_evaluation"
+            evaluation_dir.mkdir(parents=True)
+            pages = [
+                {
+                    "page_id": page_id,
+                    "start_sec": page_id * 5,
+                    "end_sec": (page_id + 1) * 5,
+                    "screenshot_path": str(run_dir / f"page_{page_id:03d}.jpg"),
+                    "speech_text": f"第{page_id}页讲话",
+                    "utterances": [{"text": f"第{page_id}页讲话"}],
+                }
+                for page_id in range(1, 7)
+            ]
+            (run_dir / "result.json").write_text(
+                json.dumps({"video_id": "retry-concurrency", "pages": pages}),
+                encoding="utf-8",
+            )
+            (run_dir / "transcript.json").write_text(
+                json.dumps({"video_id": "retry-concurrency", "pages": pages}),
+                encoding="utf-8",
+            )
+            (evaluation_dir / "llm_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "retry-concurrency",
+                        "pages": [
+                            {
+                                "page_id": page["page_id"],
+                                "status": "failed",
+                                "failure_stage": "llm",
+                                "score": 0,
+                                "reason": "timeout",
+                            }
+                            for page in pages
+                        ],
+                        "summary": {"failed_pages": 6, "complete": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed_with_errors",
+                        "mode": "full",
+                        "include_llm": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            counter_lock = threading.Lock()
+            current = 0
+            peak = 0
+
+            def score_page(page, **_kwargs):
+                nonlocal current, peak
+                with counter_lock:
+                    current += 1
+                    peak = max(peak, current)
+                time.sleep(0.08)
+                with counter_lock:
+                    current -= 1
+                return {
+                    "page_id": page["page_id"],
+                    "start_sec": page["start_sec"],
+                    "end_sec": page["end_sec"],
+                    "status": "scored",
+                    "score": 90,
+                    "reason": "相关",
+                }
+
+            with (
+                patch(
+                    "video_page_detector.desktop_v2_worker.evaluate_page",
+                    side_effect=score_page,
+                ),
+                patch("video_page_detector.desktop_v2_worker.emit") as emit,
+            ):
+                run_retry_failed_pages(
+                    {
+                        "task_id": str(run_dir),
+                        "output_root": temp,
+                        "page_ids": [1, 2, 3, 4, 5, 6],
+                        "settings": {
+                            "llm_concurrency": 5,
+                            "include_evidence": False,
+                        },
+                        "llm_api_key": "test-key",
+                        "llm_upload_consent": True,
+                    }
+                )
+
+            retry_started = next(
+                call for call in emit.call_args_list
+                if call.args == ("task.retry_started",)
+            )
+            activity_values = [
+                call.kwargs["active_cloud_requests"]
+                for call in emit.call_args_list
+                if call.args == ("cloud.activity",)
+            ]
+            self.assertEqual(retry_started.kwargs["llm_concurrency"], 5)
+            self.assertEqual(peak, 5)
+            self.assertEqual(max(activity_values), 5)
+
+    def test_asr_retry_uses_configured_three_way_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "retry-asr-concurrency"
+            run_dir.mkdir()
+            video_path = Path(temp) / "retry-asr-concurrency.mp4"
+            video_path.write_bytes(b"video")
+            pages = [
+                {
+                    "page_id": page_id,
+                    "start_sec": page_id * 5,
+                    "end_sec": (page_id + 1) * 5,
+                    "speech_text": "",
+                    "utterances": [],
+                    "failure_stage": "asr",
+                    "transcription_status": "failed",
+                }
+                for page_id in range(1, 5)
+            ]
+            (run_dir / "result.json").write_text(
+                json.dumps({"video_id": "retry-asr-concurrency", "pages": pages}),
+                encoding="utf-8",
+            )
+            (run_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "retry-asr-concurrency",
+                        "video_path": str(video_path),
+                        "pages": pages,
+                        "transcription": {
+                            "cloud_statistics": {"failed_page_count": 4}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed_with_errors",
+                        "mode": "full",
+                        "include_llm": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            counter_lock = threading.Lock()
+            current = 0
+            peak = 0
+
+            def transcribe(_video, retry_pages, **_kwargs):
+                nonlocal current, peak
+                with counter_lock:
+                    current += 1
+                    peak = max(peak, current)
+                time.sleep(0.08)
+                with counter_lock:
+                    current -= 1
+                page = dict(retry_pages[0])
+                page.update(
+                    {
+                        "speech_text": "恢复成功",
+                        "utterances": [{"text": "恢复成功"}],
+                    }
+                )
+                return [page], {}
+
+            with (
+                patch(
+                    "video_page_detector.desktop_v2_worker.transcribe_pages_with_mimo",
+                    side_effect=transcribe,
+                ),
+                patch("video_page_detector.desktop_v2_worker.emit") as emit,
+            ):
+                run_retry_failed_pages(
+                    {
+                        "task_id": str(run_dir),
+                        "output_root": temp,
+                        "page_ids": [1, 2, 3, 4],
+                        "settings": {
+                            "asr_engine": "mimo-cloud",
+                            "asr_concurrency": 3,
+                            "include_llm": False,
+                        },
+                        "asr_api_key": "test-key",
+                        "asr_upload_consent": True,
+                    }
+                )
+
+            retry_started = next(
+                call for call in emit.call_args_list
+                if call.args == ("task.retry_started",)
+            )
+            activity_values = [
+                call.kwargs["active_cloud_requests"]
+                for call in emit.call_args_list
+                if call.args == ("cloud.activity",)
+            ]
+            self.assertEqual(retry_started.kwargs["asr_concurrency"], 3)
+            self.assertEqual(peak, 3)
+            self.assertEqual(max(activity_values), 3)
 
     def test_combines_utterance_text(self) -> None:
         text = page_speech_text(
@@ -117,6 +398,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
             self.assertIsNotNone(task)
             assert task is not None
             self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["progress"], 100)
             self.assertEqual(task["pages"][0]["speech_text"], "牛顿第二定律")
             self.assertEqual(task["pages"][0]["score"], 92)
             self.assertEqual(list_tasks(temp)[0]["video_id"], "lesson")
@@ -153,6 +435,54 @@ class DesktopV2WorkerTests(unittest.TestCase):
             self.assertEqual(task["progress"], 100)
             self.assertEqual(task["mode"], "detect")
             self.assertFalse(task["include_llm"])
+
+    def test_active_task_reload_remains_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "lesson"
+            run_dir.mkdir()
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "lesson",
+                        "video_duration_sec": 10.0,
+                        "pages": [
+                            {
+                                "page_id": 1,
+                                "start_sec": 0.0,
+                                "end_sec": 10.0,
+                                "screenshot_path": "page_001.jpg",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps({"status": "running", "mode": "full"}),
+                encoding="utf-8",
+            )
+            active_thread = threading.Thread(target=lambda: time.sleep(0.2))
+            active_thread.start()
+            try:
+                with (
+                    patch(
+                        "video_page_detector.desktop_v2_worker._active_thread",
+                        active_thread,
+                    ),
+                    patch(
+                        "video_page_detector.desktop_v2_worker._active_task_dir",
+                        run_dir.resolve(),
+                    ),
+                ):
+                    task = load_task(run_dir)
+            finally:
+                active_thread.join()
+
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task["status"], "running")
+            self.assertEqual(task["stage"], "正在处理")
 
     def test_failed_page_evaluation_reloads_as_completed_with_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -225,6 +555,101 @@ class DesktopV2WorkerTests(unittest.TestCase):
             self.assertEqual(task["status"], "completed_with_errors")
             self.assertEqual(task["pages"][0]["status"], "failed")
             self.assertEqual(task["pages"][0]["failure_stage"], "asr")
+
+    def test_interrupted_task_without_transcript_reloads_as_retryable_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "interrupted"
+            run_dir.mkdir()
+            video_path = Path(temp) / "lesson.mp4"
+            video_path.write_bytes(b"video")
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "interrupted",
+                        "video_path": str(video_path),
+                        "pages": [{"page_id": 1, "start_sec": 0, "end_sec": 5}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "mode": "full",
+                        "include_llm": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            task = load_task(run_dir)
+
+            assert task is not None
+            self.assertEqual(task["status"], "completed_with_errors")
+            self.assertEqual(task["pages"][0]["status"], "failed")
+            self.assertEqual(task["pages"][0]["failure_stage"], "asr")
+            self.assertEqual(task["video_path"], str(video_path))
+
+    def test_interrupted_task_rebuilds_transcript_for_asr_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "interrupted-retry"
+            run_dir.mkdir()
+            video_path = Path(temp) / "lesson.mp4"
+            video_path.write_bytes(b"video")
+            source_page = {"page_id": 1, "start_sec": 0, "end_sec": 5}
+            (run_dir / "result.json").write_text(
+                json.dumps({"video_id": "interrupted-retry", "pages": [source_page]}),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "mode": "full",
+                        "include_llm": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            recovered_page = {
+                **source_page,
+                "speech_text": "恢复成功",
+                "utterances": [{"start_sec": 0, "end_sec": 2, "text": "恢复成功"}],
+            }
+
+            with (
+                patch(
+                    "video_page_detector.desktop_v2_worker.discover_original_video",
+                    return_value=video_path,
+                ) as discover_video,
+                patch(
+                    "video_page_detector.desktop_v2_worker.transcribe_pages_with_mimo",
+                    return_value=([recovered_page], {}),
+                ),
+                patch("video_page_detector.desktop_v2_worker.emit") as emit,
+            ):
+                run_retry_failed_pages(
+                    {
+                        "task_id": str(run_dir),
+                        "output_root": temp,
+                        "page_ids": [1],
+                        "settings": {"asr_engine": "mimo-cloud"},
+                        "asr_api_key": "test-key",
+                        "asr_upload_consent": True,
+                        "llm_upload_consent": False,
+                    }
+                )
+
+            discover_video.assert_called_once()
+            transcript = json.loads(
+                (run_dir / "transcript.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(transcript["pages"][0]["speech_text"], "恢复成功")
+            self.assertNotIn("failure_stage", transcript["pages"][0])
+            self.assertTrue(
+                any(call.args == ("task.retry_completed",) for call in emit.call_args_list)
+            )
 
     def test_deletes_task_result_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

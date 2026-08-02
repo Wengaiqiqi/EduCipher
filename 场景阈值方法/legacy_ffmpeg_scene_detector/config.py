@@ -12,6 +12,7 @@ class DetectorConfig:
     adaptive_scene_detection: bool = True
     scene_threshold_floor: float = 0.05
     minimum_scene_candidates_per_minute: float = 0.5
+    scene_scan_fps: float = 2.0
     auto_detect_screen_crop: bool = True
     screen_crop_left_ratio: float = 0.10
     screen_crop_top_ratio: float = 0.02
@@ -98,6 +99,7 @@ class DetectorConfig:
                 "change thresholds must satisfy 0 <= low < high <= 1"
             )
         positive = {
+            "scene_scan_fps": self.scene_scan_fps,
             "comparison_offset_sec": self.comparison_offset_sec,
             "stable_window_sec": self.stable_window_sec,
             "stable_sample_fps": self.stable_sample_fps,

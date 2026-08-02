@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "kexi-desktop"
-version = "2.0.7"
+version = "2.0.14"
 dependencies = [
  "serde",
  "serde_json",

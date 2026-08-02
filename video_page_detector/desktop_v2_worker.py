@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -35,6 +36,12 @@ from .transcription import (
     render_page_transcripts_markdown,
     transcribe_video_pages,
 )
+from 场景阈值方法.legacy_ffmpeg_scene_detector.config import (
+    DetectorConfig as SceneThresholdDetectorConfig,
+)
+from 场景阈值方法.legacy_ffmpeg_scene_detector.pipeline import (
+    VideoPageDetector as SceneThresholdVideoPageDetector,
+)
 
 
 _output_lock = threading.Lock()
@@ -42,6 +49,7 @@ _task_lock = threading.Lock()
 _cancel_event = threading.Event()
 _active_thread: threading.Thread | None = None
 _active_task_dir: Path | None = None
+_pending_retry_payload: dict[str, Any] | None = None
 
 
 def emit(event_type: str, **payload: Any) -> None:
@@ -114,6 +122,8 @@ def write_run_metadata(
     *,
     mode: str,
     include_llm: bool,
+    detector_algorithm: str,
+    video_path: str,
 ) -> None:
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +135,8 @@ def write_run_metadata(
                     "status": "running",
                     "mode": mode,
                     "include_llm": include_llm,
+                    "detector_algorithm": detector_algorithm,
+                    "video_path": video_path,
                 },
                 ensure_ascii=False,
             )
@@ -198,6 +210,87 @@ def page_speech_text(page: Mapping[str, Any]) -> str:
     )
 
 
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".m4v", ".webm"}
+VIDEO_SEARCH_SKIP_DIRS = {
+    "$recycle.bin",
+    "system volume information",
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "node_modules",
+    ".git",
+    "appdata",
+}
+
+
+def discover_original_video(
+    video_id: str,
+    *,
+    preferred_paths: list[str] | None = None,
+    search_roots: list[Path] | None = None,
+) -> Path | None:
+    """Find an old task's source video without interrupting retry with a picker."""
+    for raw in preferred_paths or []:
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+
+    roots: list[tuple[Path, int]] = []
+    if search_roots is not None:
+        roots.extend((Path(root), 6) for root in search_roots)
+    else:
+        drive_roots = [
+            Path(f"{letter}:\\")
+            for letter in "EFGHIJKLMNOPQRSTUVWXYZDABC"
+            if Path(f"{letter}:\\").is_dir()
+        ]
+        roots.extend((root, 3) for root in drive_roots)
+        home = Path.home()
+        roots.extend(
+            (home / name, 6)
+            for name in ("Desktop", "Downloads", "Documents", "Videos")
+        )
+
+    expected_stem = video_id.casefold()
+    visited: set[str] = set()
+    for root, max_depth in roots:
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            continue
+        marker = str(resolved_root).casefold()
+        if marker in visited or not resolved_root.is_dir():
+            continue
+        visited.add(marker)
+        queue: deque[tuple[Path, int]] = deque([(resolved_root, 0)])
+        while queue:
+            directory, depth = queue.popleft()
+            try:
+                entries = list(directory.iterdir())
+            except (OSError, PermissionError):
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        if (
+                            entry.stem.casefold() == expected_stem
+                            and entry.suffix.casefold() in VIDEO_EXTENSIONS
+                        ):
+                            return entry.resolve()
+                    elif (
+                        depth < max_depth
+                        and entry.name.casefold() not in VIDEO_SEARCH_SKIP_DIRS
+                        and not entry.name.startswith(".")
+                    ):
+                        queue.append((entry, depth + 1))
+                except (OSError, PermissionError):
+                    continue
+    return None
+
+
 def resolve_screenshot_path(page: Mapping[str, Any], run_dir: Path) -> str:
     """Resolve screenshot_path to an absolute Windows path string suitable for convertFileSrc."""
     raw = str(page.get("screenshot_path") or "").strip()
@@ -218,6 +311,20 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         run_dir / "llm_evaluation" / "llm_evaluation.json"
     )
     metadata = read_json(run_metadata_path(run_dir)) or {}
+    metadata_status = str(metadata.get("status") or "")
+    mode = str(
+        metadata.get("mode")
+        or ("full" if transcript or evaluation else "detect")
+    )
+    include_llm = bool(metadata.get("include_llm", bool(evaluation)))
+    actively_running = bool(
+        _active_thread is not None
+        and _active_thread.is_alive()
+        and _active_task_dir == run_dir.resolve()
+    )
+    interrupted = (
+        metadata_status in {"running", "retrying"} and not actively_running
+    ) or metadata_status in {"failed", "cancelled"}
     evaluation_pages = evaluation.get("pages", []) if evaluation else []
     evidence_enabled = bool(
         evaluation
@@ -280,6 +387,34 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             )
             if row["status"] == "failed" and not row.get("failure_stage"):
                 row["failure_stage"] = "llm"
+    if mode == "full" and interrupted:
+        transcript_ids = {
+            int(page["page_id"])
+            for page in (transcript or {}).get("pages", [])
+            if isinstance(page, Mapping) and "page_id" in page
+        }
+        evaluation_ids = {
+            int(page["page_id"])
+            for page in (evaluation or {}).get("pages", [])
+            if isinstance(page, Mapping) and "page_id" in page
+        }
+        for page_id, row in page_map.items():
+            if page_id not in transcript_ids:
+                row.update(
+                    {
+                        "status": "failed",
+                        "failure_stage": "asr",
+                        "reason": "任务在本页语音识别完成前中断，可重试本页语音识别。",
+                    }
+                )
+            elif include_llm and page_id not in evaluation_ids:
+                row.update(
+                    {
+                        "status": "failed",
+                        "failure_stage": "llm",
+                        "reason": "任务在本页关联度评分完成前中断，可重试本页关联度评分。",
+                    }
+                )
     try:
         updated_at = (run_dir / "result.json").stat().st_mtime * 1000
     except OSError:
@@ -297,12 +432,16 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         else 0
     )
     evaluation_complete = evaluation_summary.get("complete")
-    metadata_status = str(metadata.get("status") or "")
+    recovered_failed_pages = sum(
+        page.get("status") == "failed" for page in page_map.values()
+    )
     completed_with_errors = bool(
         evaluation
         and (failed_pages > 0 or evaluation_complete is False)
-    ) or asr_failed_pages > 0 or metadata_status == "completed_with_errors"
-    if completed_with_errors:
+    ) or asr_failed_pages > 0 or recovered_failed_pages > 0 or metadata_status == "completed_with_errors"
+    if actively_running:
+        task_status = "running"
+    elif completed_with_errors:
         task_status = "completed_with_errors"
     elif metadata_status == "completed" or evaluation:
         task_status = "completed"
@@ -311,11 +450,6 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
     else:
         task_status = "idle"
     finished = task_status in {"completed", "completed_with_errors"}
-    mode = str(
-        metadata.get("mode")
-        or ("full" if transcript or evaluation else "detect")
-    )
-    include_llm = bool(metadata.get("include_llm", bool(evaluation)))
     completed_stages = ["ppt"]
     if transcript:
         completed_stages.append("voice")
@@ -327,24 +461,30 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
 
         "id": str(run_dir.resolve()),
         "video_id": str(detection.get("video_id") or run_dir.name),
-        "video_path": str(detection.get("video_path") or ""),
+        "video_path": str(
+            detection.get("video_path") or metadata.get("video_path") or ""
+        ),
         "run_dir": str(run_dir.resolve()),
         "updated_at": updated_at,
         "status": task_status,
         "progress": 100 if finished else (78 if transcript else 36),
         "stage": (
-            "处理完成，但部分页面存在错误"
-            if completed_with_errors
+            "正在处理"
+            if task_status == "running"
             else (
-                "处理完成"
-                if task_status == "completed"
+                "处理完成，但部分页面存在错误"
+                if completed_with_errors
                 else (
-                    "处理失败"
-                    if task_status == "failed"
+                    "处理完成"
+                    if task_status == "completed"
                     else (
-                        "等待关联度评分"
-                        if transcript
-                        else "PPT页面识别完成"
+                        "处理失败"
+                        if task_status == "failed"
+                        else (
+                            "等待关联度评分"
+                            if transcript
+                            else "PPT页面识别完成"
+                        )
                     )
                 )
             )
@@ -495,6 +635,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         with _task_lock:
             _active_task_dir = run_dir
         task_id = str(run_dir.resolve())
+        detection = read_json(run_dir / "result.json") or {}
         transcript_path = run_dir / "transcript.json"
         transcript = read_json(transcript_path)
         evaluation_path = run_dir / "llm_evaluation" / "llm_evaluation.json"
@@ -503,8 +644,79 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         previous_metadata_status = str(
             metadata.get("status") or "completed_with_errors"
         )
+        interrupted = str(metadata.get("status") or "") in {
+            "running",
+            "retrying",
+            "failed",
+            "cancelled",
+        }
         if not transcript or not isinstance(transcript.get("pages"), list):
-            raise ValueError("该任务没有可供单页重试的转写结果。")
+            if not interrupted or not isinstance(detection.get("pages"), list):
+                raise ValueError("该任务没有可供单页重试的转写结果。")
+            transcript = {
+                "video_id": str(detection.get("video_id") or run_dir.name),
+                "video_path": str(
+                    payload.get("video_path")
+                    or metadata.get("video_path")
+                    or detection.get("video_path")
+                    or ""
+                ),
+                "video_duration_sec": detection.get("video_duration_sec"),
+                "ppt_result_path": str((run_dir / "result.json").resolve()),
+                "pages": [
+                    {
+                        **dict(page),
+                        "speech_text": "",
+                        "utterances": [],
+                        "transcription_status": "failed",
+                        "failure_stage": "asr",
+                        "reason": "任务在本页语音识别完成前中断。",
+                    }
+                    for page in detection["pages"]
+                    if isinstance(page, Mapping) and "page_id" in page
+                ],
+                "transcription": {
+                    "engine": "mimo-cloud",
+                    "cloud_statistics": {
+                        "failed_page_count": len(detection["pages"]),
+                    },
+                },
+                "artifacts": {
+                    "transcript_json": str(transcript_path.resolve()),
+                    "page_transcript_markdown": str(
+                        (run_dir / "逐页语音文字.md").resolve()
+                    ),
+                },
+            }
+            write_json(transcript_path, transcript)
+        elif interrupted:
+            transcript_by_id = {
+                int(page["page_id"]): dict(page)
+                for page in transcript.get("pages", [])
+                if isinstance(page, Mapping) and "page_id" in page
+            }
+            for page in detection.get("pages", []):
+                if not isinstance(page, Mapping) or "page_id" not in page:
+                    continue
+                page_id = int(page["page_id"])
+                if page_id not in transcript_by_id:
+                    transcript_by_id[page_id] = {
+                        **dict(page),
+                        "speech_text": "",
+                        "utterances": [],
+                        "transcription_status": "failed",
+                        "failure_stage": "asr",
+                        "reason": "任务在本页语音识别完成前中断。",
+                    }
+            transcript["pages"] = [
+                transcript_by_id[key] for key in sorted(transcript_by_id)
+            ]
+        if interrupted and bool(metadata.get("include_llm", True)) and not evaluation:
+            evaluation = {
+                "video_id": str(transcript.get("video_id") or run_dir.name),
+                "pages": [],
+                "summary": {"failed_pages": 0, "complete": False},
+            }
 
         failed_by_id: dict[int, dict[str, Any]] = {}
         for page in transcript.get("pages", []):
@@ -522,6 +734,24 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             merged.update(dict(item))
             merged.setdefault("failure_stage", "llm")
             failed_by_id[page_id] = merged
+        if interrupted and bool(metadata.get("include_llm", True)):
+            evaluated_ids = {
+                int(item["page_id"])
+                for item in evaluation.get("pages", [])
+                if isinstance(item, Mapping) and "page_id" in item
+            }
+            for page in transcript.get("pages", []):
+                if (
+                    isinstance(page, Mapping)
+                    and "page_id" in page
+                    and page.get("failure_stage") != "asr"
+                    and int(page["page_id"]) not in evaluated_ids
+                ):
+                    failed_by_id[int(page["page_id"])] = {
+                        **dict(page),
+                        "failure_stage": "llm",
+                        "reason": "任务在本页关联度评分完成前中断。",
+                    }
 
         requested = payload.get("page_ids")
         if isinstance(requested, list) and requested:
@@ -539,7 +769,6 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             raise ValueError("桌面端设置格式不正确。")
         metadata["status"] = "retrying"
         write_json(run_metadata_path(run_dir), metadata)
-        emit("task.retry_started", task_id=task_id, page_ids=target_ids)
 
         transcript_pages = {
             int(page["page_id"]): dict(page)
@@ -556,20 +785,81 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             for page_id in target_ids
             if failed_by_id[page_id].get("failure_stage") != "asr"
         ]
+        retry_asr_config = (
+            transcription_config(settings) if asr_target_ids else None
+        )
+        will_retry_llm = bool(
+            llm_target_ids or (asr_target_ids and evaluation)
+        )
+        retry_llm_settings = llm_config(settings) if will_retry_llm else None
+        emit(
+            "task.retry_started",
+            task_id=task_id,
+            page_ids=target_ids,
+            asr_concurrency=(
+                retry_asr_config.mimo_max_concurrency
+                if retry_asr_config is not None
+                else 0
+            ),
+            llm_concurrency=(
+                retry_llm_settings.max_concurrency
+                if retry_llm_settings is not None
+                else 0
+            ),
+        )
+        activity_lock = threading.Lock()
+        active_asr = 0
+        active_llm = 0
+        peak_asr = 0
+        peak_llm = 0
+
+        def emit_retry_activity() -> None:
+            emit(
+                "cloud.activity",
+                task_id=task_id,
+                active_cloud_requests=active_asr + active_llm,
+                asr_active_requests=active_asr,
+                llm_active_requests=active_llm,
+                cloud_limit=min(
+                    10,
+                    (retry_asr_config.mimo_max_concurrency if retry_asr_config else 0)
+                    + (retry_llm_settings.max_concurrency if retry_llm_settings else 0),
+                ),
+            )
 
         if asr_target_ids:
             if not bool(payload.get("asr_upload_consent")):
                 raise ValueError("请确认允许重新发送失败页的临时音频。")
-            asr_config = transcription_config(settings)
+            assert retry_asr_config is not None
+            asr_config = retry_asr_config
             if asr_config.engine != "mimo-cloud":
                 raise ValueError("云端 ASR 失败页重试需要选择 ASR 模型服务。")
             asr_key = resolve_mimo_api_key(
                 asr_config.mimo_api_key_env,
                 str(payload.get("asr_api_key") or ""),
             )
-            video_path = Path(str(transcript.get("video_path") or ""))
-            if not video_path.is_file():
-                raise FileNotFoundError("原始视频不存在，无法重试语音识别。")
+            video_path = discover_original_video(
+                str(
+                    detection.get("video_id")
+                    or transcript.get("video_id")
+                    or run_dir.name
+                ),
+                preferred_paths=[
+                    str(payload.get("video_path") or ""),
+                    str(transcript.get("video_path") or ""),
+                    str(metadata.get("video_path") or ""),
+                    str(detection.get("video_path") or ""),
+                ],
+            )
+            if video_path is None:
+                raise FileNotFoundError(
+                    "未能根据任务名称自动找到原始视频，无法重试语音识别。"
+                )
+            transcript["video_path"] = str(video_path.resolve())
+            metadata["video_path"] = str(video_path.resolve())
+            detection["video_path"] = str(video_path.resolve())
+            write_json(run_dir / "result.json", detection)
+            write_json(run_metadata_path(run_dir), metadata)
             asr_settings = MimoASRSettings(
                 base_url=asr_config.mimo_base_url,
                 model=asr_config.mimo_model,
@@ -580,20 +870,17 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 max_retries=asr_config.mimo_max_retries,
                 ffmpeg_path=asr_config.ffmpeg_path,
             )
-            activity_lock = threading.Lock()
-            active_asr = 0
-
             def retry_asr(page_id: int) -> tuple[int, dict[str, Any]]:
-                nonlocal active_asr
+                nonlocal active_asr, peak_asr
                 require_not_cancelled()
+                active_page = dict(transcript_pages[page_id])
+                active_page.pop("failure_stage", None)
+                active_page.pop("reason", None)
+                emit_page(active_page, "transcribing", task_id=task_id)
                 with activity_lock:
                     active_asr += 1
-                    emit(
-                        "cloud.activity",
-                        task_id=task_id,
-                        active_cloud_requests=active_asr,
-                        cloud_limit=asr_config.mimo_max_concurrency,
-                    )
+                    peak_asr = max(peak_asr, active_asr)
+                    emit_retry_activity()
                 try:
                     pages, _ = transcribe_pages_with_mimo(
                         video_path,
@@ -605,12 +892,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 finally:
                     with activity_lock:
                         active_asr = max(0, active_asr - 1)
-                        emit(
-                            "cloud.activity",
-                            task_id=task_id,
-                            active_cloud_requests=active_asr,
-                            cloud_limit=asr_config.mimo_max_concurrency,
-                        )
+                        emit_retry_activity()
 
             with ThreadPoolExecutor(
                 max_workers=min(asr_config.mimo_max_concurrency, len(asr_target_ids)),
@@ -672,6 +954,8 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             cloud_statistics["retry_request_count"] = int(
                 cloud_statistics.get("retry_request_count", 0)
             ) + len(asr_target_ids)
+            cloud_statistics["retry_max_concurrency"] = asr_config.mimo_max_concurrency
+            cloud_statistics["retry_peak_concurrency"] = peak_asr
             write_json(transcript_path, transcript)
             transcript_markdown = Path(
                 str(
@@ -690,7 +974,8 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         if llm_target_ids:
             if not bool(payload.get("llm_upload_consent")):
                 raise ValueError("请确认允许重新发送失败页截图和课堂转写。")
-            llm_settings = llm_config(settings)
+            assert retry_llm_settings is not None
+            llm_settings = retry_llm_settings
             llm_key = str(payload.get("llm_api_key") or "").strip()
             llm_key = llm_key or os.environ.get("LLM_API_KEY", "").strip()
             if not llm_key:
@@ -700,20 +985,17 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 for item in evaluation.get("pages", [])
                 if isinstance(item, Mapping) and "page_id" in item
             }
-            activity_lock = threading.Lock()
-            active_llm = 0
-
             def retry_llm(page_id: int) -> tuple[int, dict[str, Any]]:
-                nonlocal active_llm
+                nonlocal active_llm, peak_llm
                 require_not_cancelled()
+                active_page = dict(transcript_pages[page_id])
+                active_page.pop("failure_stage", None)
+                active_page.pop("reason", None)
+                emit_page(active_page, "scoring", task_id=task_id)
                 with activity_lock:
                     active_llm += 1
-                    emit(
-                        "cloud.activity",
-                        task_id=task_id,
-                        active_cloud_requests=active_llm,
-                        cloud_limit=llm_settings.max_concurrency,
-                    )
+                    peak_llm = max(peak_llm, active_llm)
+                    emit_retry_activity()
                 try:
                     result = evaluate_page(
                         transcript_pages[page_id],
@@ -728,12 +1010,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 finally:
                     with activity_lock:
                         active_llm = max(0, active_llm - 1)
-                        emit(
-                            "cloud.activity",
-                            task_id=task_id,
-                            active_cloud_requests=active_llm,
-                            cloud_limit=llm_settings.max_concurrency,
-                        )
+                        emit_retry_activity()
 
             unique_llm_ids = sorted(set(llm_target_ids))
             with ThreadPoolExecutor(
@@ -796,6 +1073,14 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             3,
         )
         metadata["completed_at"] = time.time()
+        metadata["retry_asr_concurrency"] = (
+            retry_asr_config.mimo_max_concurrency if retry_asr_config else 0
+        )
+        metadata["retry_llm_concurrency"] = (
+            retry_llm_settings.max_concurrency if retry_llm_settings else 0
+        )
+        metadata["retry_peak_asr_concurrency"] = peak_asr
+        metadata["retry_peak_llm_concurrency"] = peak_llm
         asr_failed = sum(
             page.get("failure_stage") == "asr"
             for page in transcript.get("pages", [])
@@ -833,6 +1118,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             if run_dir is not None and _active_task_dir == run_dir.resolve():
                 _active_task_dir = None
         _cancel_event.clear()
+        launch_pending_retry()
 
 
 def require_not_cancelled() -> None:
@@ -847,17 +1133,24 @@ def default_detector_config(settings: Mapping[str, Any]) -> DetectorConfig:
         if config_path.is_file()
         else DetectorConfig()
     )
-    preset = str(settings.get("detector_preset") or "precise")
-    if preset == "fast":
-        config = replace(
-            config,
-            temporal_sample_interval_sec=4.0,
-            temporal_confirmation_sec=12.0,
-            temporal_analysis_width=256,
-            temporal_analysis_height=144,
-            temporal_refinement_fps=2.0,
-            jpeg_quality=85,
-        )
+    config = replace(
+        config,
+        ffmpeg_path=bundled_tool("ffmpeg") or config.ffmpeg_path,
+        ffprobe_path=bundled_tool("ffprobe") or config.ffprobe_path,
+    )
+    config.validate()
+    return config
+
+
+def detector_algorithm(settings: Mapping[str, Any]) -> str:
+    value = str(settings.get("detector_algorithm") or "temporal").strip()
+    if value not in {"temporal", "scene-threshold"}:
+        raise ValueError(f"不支持的 PPT 页面识别算法：{value}")
+    return value
+
+
+def scene_threshold_detector_config() -> SceneThresholdDetectorConfig:
+    config = SceneThresholdDetectorConfig()
     config = replace(
         config,
         ffmpeg_path=bundled_tool("ffmpeg") or config.ffmpeg_path,
@@ -874,10 +1167,23 @@ def transcription_config(settings: Mapping[str, Any]) -> TranscriptionConfig:
         if config_path.is_file()
         else TranscriptionConfig()
     )
+    engine = str(settings.get("asr_engine") or base.engine)
+    model = str(settings.get("asr_model") or base.model).strip()
+    if settings.get("asr_engine") == "faster-whisper":
+        if not str(settings.get("asr_model") or "").strip():
+            raise ValueError("请选择本地 faster-whisper 模型权重文件夹。")
+        model_dir = Path(model).expanduser()
+        if not model_dir.is_dir():
+            raise ValueError(f"本地模型文件夹不存在：{model_dir}")
+        if not (model_dir / "model.bin").is_file():
+            raise ValueError(
+                f"所选文件夹中没有 model.bin，请选择完整的 faster-whisper 模型目录：{model_dir}"
+            )
+        model = str(model_dir.resolve())
     config = replace(
         base,
-        engine=str(settings.get("asr_engine") or base.engine),
-        model=str(settings.get("asr_model") or base.model),
+        engine=engine,
+        model=model,
         mimo_base_url=str(
             settings.get("mimo_base_url") or base.mimo_base_url
         ),
@@ -958,6 +1264,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
         task_id = str(run_dir.resolve())
         include_llm = bool(settings.get("include_llm", True)) and mode == "full"
 
+        selected_detector_algorithm = detector_algorithm(settings)
         emit(
             "task.started",
             task_id=task_id,
@@ -965,18 +1272,25 @@ def run_task(payload: Mapping[str, Any]) -> None:
             video_path=str(video.resolve()),
             run_dir=str(run_dir.resolve()),
             started_at=time.time(),
-            algorithm_version="1.4.3",
-            streaming_page_confirmation=True,
+            algorithm_version="1.4.9",
+            streaming_page_confirmation=(selected_detector_algorithm == "temporal"),
+            detector_algorithm=selected_detector_algorithm,
             mode=mode,
             include_llm=include_llm,
             include_evidence=bool(settings.get("include_evidence", False)),
         )
-        detector = VideoPageDetector(default_detector_config(settings))
+        detector = (
+            VideoPageDetector(default_detector_config(settings))
+            if selected_detector_algorithm == "temporal"
+            else SceneThresholdVideoPageDetector(scene_threshold_detector_config())
+        )
         write_run_metadata(
             run_dir,
             time.time(),
             mode=mode,
             include_llm=include_llm,
+            detector_algorithm=selected_detector_algorithm,
+            video_path=str(video.resolve()),
         )
         transcribe_config = transcription_config(settings) if mode == "full" else None
         llm_settings = llm_config(settings) if include_llm else None
@@ -1033,7 +1347,11 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 if stage in {"云端语音识别", "语音转写"}:
                     page = cloud_pipeline._page_transcripts.get(page_id)
                     if page:
-                        emit_page(page, "scoring" if include_llm else "completed", task_id=task_id)
+                        emit_page(
+                            page,
+                            "cloud_waiting" if include_llm else "completed",
+                            task_id=task_id,
+                        )
                     elif page_id in cloud_pipeline._asr_errors:
                         failed_page = cloud_pipeline._submitted_pages.get(
                             page_id, {"page_id": page_id}
@@ -1084,6 +1402,11 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     active_cloud_requests=active,
                     cloud_limit=limit,
                 ),
+                page_activity_callback=lambda page, status: emit_page(
+                    page,
+                    status,
+                    task_id=task_id,
+                ),
                 cancel_event=_cancel_event,
             )
 
@@ -1103,7 +1426,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             require_not_cancelled()
             emit_page(
                 page,
-                "transcribing" if cloud_pipeline else "detected",
+                "cloud_waiting" if cloud_pipeline else "detected",
                 task_id=task_id,
             )
             emit(
@@ -1117,13 +1440,30 @@ def run_task(payload: Mapping[str, Any]) -> None:
             if cloud_pipeline:
                 cloud_pipeline.submit_page(page, completed, total)
 
-        detection = detector.run(
-            video,
-            output_root=output_root,
-            video_id=video_id,
-            progress_callback=detection_progress,
-            page_ready_callback=page_ready,
-        )
+        if selected_detector_algorithm == "temporal":
+            detection = detector.run(
+                video,
+                output_root=output_root,
+                video_id=video_id,
+                progress_callback=detection_progress,
+                page_ready_callback=page_ready,
+            )
+        else:
+            detection = detector.run(
+                video,
+                output_root=output_root,
+                video_id=video_id,
+                progress_callback=detection_progress,
+            )
+            pages = detection.get("pages", [])
+            for page_index, page in enumerate(pages, start=1):
+                if isinstance(page, dict):
+                    page_ready(page, page_index, len(pages))
+        analysis = detection.setdefault("analysis", {})
+        if isinstance(analysis, dict):
+            analysis["detector_algorithm"] = selected_detector_algorithm
+        detection["video_path"] = str(video.resolve())
+        write_json(result_path, detection)
         require_not_cancelled()
         emit(
             "task.progress",
@@ -1294,6 +1634,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             if run_dir is not None and _active_task_dir == run_dir.resolve():
                 _active_task_dir = None
         _cancel_event.clear()
+        launch_pending_retry()
 
 
 def start_task(payload: Mapping[str, Any]) -> None:
@@ -1313,13 +1654,25 @@ def start_task(payload: Mapping[str, Any]) -> None:
 
 
 def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
-    global _active_thread
+    global _active_thread, _pending_retry_payload
     with _task_lock:
         if _active_thread is not None and _active_thread.is_alive():
+            queued = dict(payload)
+            if _pending_retry_payload is not None:
+                existing_ids = _pending_retry_payload.get("page_ids")
+                incoming_ids = queued.get("page_ids")
+                if isinstance(existing_ids, list) and isinstance(incoming_ids, list):
+                    queued["page_ids"] = sorted(
+                        {int(value) for value in existing_ids + incoming_ids}
+                    )
+                else:
+                    queued.pop("page_ids", None)
+            _pending_retry_payload = queued
             emit(
-                "task.retry_failed",
+                "task.retry_queued",
                 task_id=str(payload.get("task_id") or ""),
-                error="已有任务正在处理中，请稍后再重试。",
+                page_ids=queued.get("page_ids") or [],
+                message="当前主流程仍在处理，失败页重试已加入队列。",
             )
             return
         _cancel_event.clear()
@@ -1332,13 +1685,29 @@ def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         _active_thread.start()
 
 
+def launch_pending_retry() -> None:
+    global _active_thread, _pending_retry_payload
+    with _task_lock:
+        if _pending_retry_payload is None:
+            return
+        payload = _pending_retry_payload
+        _pending_retry_payload = None
+        _active_thread = threading.Thread(
+            target=run_retry_failed_pages,
+            args=(payload,),
+            daemon=True,
+            name="desktop-v2-page-retry",
+        )
+        _active_thread.start()
+
+
 def handle_command(command: Mapping[str, Any]) -> None:
     action = str(command.get("action") or "")
     if action == "ping":
         emit(
             "worker.ready",
             project_root=str(project_root()),
-            algorithm_version="1.4.3",
+            algorithm_version="1.4.9",
             ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
             ffprobe_path=bundled_tool("ffprobe") or "PATH",
         )
@@ -1384,7 +1753,7 @@ def main() -> int:
     emit(
         "worker.ready",
         project_root=str(project_root()),
-        algorithm_version="1.4.3",
+        algorithm_version="1.4.9",
         ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
         ffprobe_path=bundled_tool("ffprobe") or "PATH",
     )

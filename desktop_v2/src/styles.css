@@ -737,6 +737,12 @@ select:focus-visible {
   padding: 4px 0;
 }
 
+.page-card-retry {
+  min-width: 98px;
+  padding: 6px 8px !important;
+  font-size: 11px;
+}
+
 .status-chip {
   min-width: 98px;
   height: 29px;
@@ -768,6 +774,13 @@ select:focus-visible {
   color: #62a6ff;
   border-color: rgba(77, 145, 255, 0.4);
   background: rgba(55, 114, 208, 0.13);
+}
+
+.status-chip.retry_waiting,
+.status-chip.cloud_waiting {
+  color: #8691a4;
+  border-color: rgba(134, 145, 164, 0.35);
+  background: rgba(134, 145, 164, 0.09);
 }
 
 .status-chip.failed {
@@ -1393,6 +1406,10 @@ select:focus-visible {
 }
 
 .settings-grid section.wide {
+  grid-column: 1 / -1;
+}
+
+.settings-grid .settings-error {
   grid-column: 1 / -1;
 }
 

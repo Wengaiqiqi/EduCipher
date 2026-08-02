@@ -165,6 +165,21 @@ class VideoPageDetector:
                 source,
                 threshold=threshold,
                 crop_ratios=crop_ratios,
+                scan_fps=self.config.scene_scan_fps,
+                progress_callback=lambda processed_sec, current_attempt=attempt: report(
+                    (
+                        f"正在使用 FFmpeg 粗筛场景变化（阈值 {threshold:g}，"
+                        f"第 {current_attempt} 次） · "
+                        f"已扫描 {min(processed_sec, metadata.duration_sec):.0f}/"
+                        f"{metadata.duration_sec:.0f} 秒"
+                    ),
+                    min(
+                        0.24,
+                        0.10
+                        + 0.14
+                        * min(processed_sec / metadata.duration_sec, 1.0),
+                    ),
+                ),
             )
             scene_threshold_used = threshold
             if (
@@ -540,6 +555,7 @@ class VideoPageDetector:
             "scene_candidate_count": len(scene_timestamps),
             "scene_threshold_requested": self.config.scene_threshold,
             "scene_threshold_used": scene_threshold_used,
+            "scene_scan_fps": self.config.scene_scan_fps,
             "minimum_scene_candidate_target": minimum_candidate_count,
             "screen_crop_ratios": {
                 "left": crop_ratios[0],
@@ -586,6 +602,7 @@ class VideoPageDetector:
                 "scene_candidate_count": len(scene_timestamps),
                 "scene_threshold_requested": self.config.scene_threshold,
                 "scene_threshold_used": scene_threshold_used,
+                "scene_scan_fps": self.config.scene_scan_fps,
                 "minimum_scene_candidate_target": minimum_candidate_count,
                 "screen_crop_ratios": {
                     "left": crop_ratios[0],

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -87,6 +88,8 @@ class FFmpegTools:
         *,
         threshold: float,
         crop_ratios: tuple[float, float, float, float] | None = None,
+        scan_fps: float = 2.0,
+        progress_callback: Callable[[float], None] | None = None,
     ) -> list[float]:
         filters: list[str] = []
         if crop_ratios is not None:
@@ -99,12 +102,25 @@ class FFmpegTools:
                     f"iw*{left:.6f}:ih*{top:.6f}"
                 )
             )
-        filters.extend([f"select=gt(scene\\,{threshold})", "showinfo"])
+        filters.extend(
+            [
+                f"fps={scan_fps:g}",
+                (
+                    f"scale={self.analysis_width}:{self.analysis_height}:"
+                    "flags=fast_bilinear"
+                ),
+                f"select=gt(scene\\,{threshold})",
+                "showinfo",
+            ]
+        )
         filter_graph = ",".join(filters)
         command = [
             self.ffmpeg,
             "-hide_banner",
+            "-nostdin",
             "-nostats",
+            "-stats_period",
+            "1",
             "-loglevel",
             "info",
             "-i",
@@ -113,19 +129,67 @@ class FFmpegTools:
             filter_graph,
             "-an",
             "-sn",
+            "-dn",
+            "-progress",
+            "pipe:1",
             "-f",
             "null",
             "-",
         ]
-        completed = subprocess.run(command, capture_output=True, check=False)
-        stderr = completed.stderr.decode("utf-8", errors="replace")
-        if completed.returncode != 0:
-            tail = "\n".join(stderr.splitlines()[-12:])
+        creation_flags = (
+            subprocess.CREATE_NO_WINDOW
+            if hasattr(subprocess, "CREATE_NO_WINDOW")
+            else 0
+        )
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creation_flags,
+        )
+        timestamps: set[float] = set()
+        output_tail: list[str] = []
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                output_tail.append(line.rstrip())
+                if len(output_tail) > 40:
+                    del output_tail[:-40]
+                for match in re.findall(
+                    r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
+                    line,
+                ):
+                    timestamps.add(float(match))
+                if progress_callback is not None and line.startswith("out_time="):
+                    value = line.partition("=")[2].strip()
+                    parts = value.split(":")
+                    if len(parts) == 3:
+                        try:
+                            processed_sec = (
+                                float(parts[0]) * 3600
+                                + float(parts[1]) * 60
+                                + float(parts[2])
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            progress_callback(processed_sec)
+            return_code = process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+        if return_code != 0:
+            tail = "\n".join(output_tail[-12:])
             raise FFmpegError(f"FFmpeg scene detection failed:\n{tail}")
-        timestamps = {
-            float(match)
-            for match in re.findall(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)", stderr)
-        }
         return sorted(timestamp for timestamp in timestamps if timestamp > 0)
 
     def sample_window(
