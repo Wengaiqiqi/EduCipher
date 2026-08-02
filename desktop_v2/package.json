@@ -1,14 +1,15 @@
 {
   "name": "classroom-ppt-desktop-v2",
   "private": true,
-  "version": "2.0.4",
+  "version": "2.0.7",
   "description": "课析 - 课堂视频与 PPT 智能分析桌面端",
   "scripts": {
     "dev": "tauri dev",
     "web:dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "desktop": "tauri dev",
-    "dist:win": "tauri build"
+    "build:worker": "cd .. && python -m PyInstaller --noconfirm build_desktop_v2_worker.spec",
+    "dist:win": "npm run build:worker && tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

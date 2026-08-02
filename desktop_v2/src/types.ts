@@ -18,6 +18,7 @@ export interface PageRecord {
   evidence?: Array<{ ppt: string; speech: string }>;
   status?: PageStatus;
   confidence?: string;
+  failure_stage?: "asr" | "llm";
 }
 
 export interface TaskRecord {
@@ -93,6 +94,7 @@ export interface WorkerEvent {
   completed_stage?: "ppt" | "voice" | "llm" | "report";
   page?: PageRecord;
   pages?: PageRecord[];
+  page_ids?: number[];
   result?: TaskRecord;
   error?: string;
   traceback?: string;

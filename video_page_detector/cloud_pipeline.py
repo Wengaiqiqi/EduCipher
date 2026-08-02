@@ -107,6 +107,7 @@ class CloudPagePipeline:
         )
         self._asr_futures: list[Future[Any]] = []
         self._llm_futures: list[Future[Any]] = []
+        self._submitted_pages: dict[int, dict[str, Any]] = {}
         self._page_transcripts: dict[int, dict[str, Any]] = {}
         self._asr_statistics: dict[int, dict[str, Any]] = {}
         self._evaluations: dict[int, dict[str, Any]] = {}
@@ -201,6 +202,7 @@ class CloudPagePipeline:
             self._total_pages = max(self._total_pages, total)
             if self._first_asr_submitted_at is None:
                 self._first_asr_submitted_at = time.perf_counter()
+            self._submitted_pages[page_id] = page_copy
             future = self._asr_executor.submit(
                 self._transcribe_page,
                 page_copy,
@@ -338,6 +340,7 @@ class CloudPagePipeline:
             evaluation = {
                 "page_id": page_id,
                 "status": "failed",
+                "failure_stage": "llm",
                 "speech_relevance": 0,
                 "ppt_coverage": 0,
                 "evidence_consistency": 0,
@@ -347,6 +350,8 @@ class CloudPagePipeline:
             }
             if self.llm_config is not None and self.llm_config.include_evidence:
                 evaluation["matched_evidence"] = []
+        if evaluation.get("status") == "failed":
+            evaluation["failure_stage"] = "llm"
         with self._lock:
             if self._aborted:
                 return
@@ -357,7 +362,11 @@ class CloudPagePipeline:
             total = self._total_pages
         self._report(
             "LLM关联度评分",
-            f"第{page_id}页评分完成",
+            (
+                f"第{page_id}页评分失败"
+                if evaluation.get("status") == "failed"
+                else f"第{page_id}页评分完成"
+            ),
             completed,
             total,
         )
@@ -388,11 +397,37 @@ class CloudPagePipeline:
         ]
         expected_ids = {int(page["page_id"]) for page in pages}
         if self._asr_errors:
-            details = "; ".join(
-                f"第{page_id}页：{error}"
-                for page_id, error in sorted(self._asr_errors.items())
-            )
-            raise RuntimeError(f"页面流水线语音识别失败：{details}")
+            for page_id, error in self._asr_errors.items():
+                source = dict(
+                    self._submitted_pages.get(page_id, {"page_id": page_id})
+                )
+                source.update(
+                    {
+                        "speech_text": "",
+                        "utterances": [],
+                        "transcription_status": "failed",
+                        "failure_stage": "asr",
+                        "reason": str(error),
+                    }
+                )
+                self._page_transcripts[page_id] = source
+                if self.llm_config is not None:
+                    failed_evaluation: dict[str, Any] = {
+                        "page_id": page_id,
+                        "start_sec": round(float(source.get("start_sec", 0.0)), 3),
+                        "end_sec": round(float(source.get("end_sec", 0.0)), 3),
+                        "status": "failed",
+                        "failure_stage": "asr",
+                        "speech_relevance": 0,
+                        "ppt_coverage": 0,
+                        "evidence_consistency": 0,
+                        "score": 0,
+                        "level": "语音识别失败",
+                        "reason": str(error),
+                    }
+                    if self.llm_config.include_evidence:
+                        failed_evaluation["matched_evidence"] = []
+                    self._evaluations[page_id] = failed_evaluation
         if set(self._page_transcripts) != expected_ids:
             missing = sorted(expected_ids - set(self._page_transcripts))
             raise RuntimeError(f"页面流水线缺少语音结果：{missing}")
@@ -462,6 +497,7 @@ class CloudPagePipeline:
                         self._cloud_concurrency_limit
                     ),
                     "peak_combined_cloud_requests": self._peak_cloud_requests,
+                    "failed_page_count": len(self._asr_errors),
                     "max_chunk_duration_sec": (
                         self.transcription_config.mimo_max_chunk_duration_sec
                     ),

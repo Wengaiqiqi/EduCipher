@@ -3,27 +3,45 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
 import traceback
-from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping
 
 from .cloud_pipeline import CloudPagePipeline
 from .config import DetectorConfig
-from .llm_evaluation import LLMEvaluationConfig, evaluate_transcript
-from .mimo_asr import resolve_mimo_api_key
+from .llm_evaluation import (
+    PROMPT_VERSION,
+    LLMEvaluationConfig,
+    evaluate_page,
+    evaluate_transcript,
+    render_evaluation_markdown,
+    summarize_evaluations,
+)
+from .mimo_asr import (
+    MimoASRSettings,
+    resolve_mimo_api_key,
+    transcribe_pages_with_mimo,
+)
 from .output_paths import resolve_run_directory, validate_video_id
 from .pipeline import VideoPageDetector
-from .transcription import TranscriptionConfig, transcribe_video_pages
+from .transcription import (
+    TranscriptionConfig,
+    render_page_transcripts_markdown,
+    transcribe_video_pages,
+)
 
 
 _output_lock = threading.Lock()
 _task_lock = threading.Lock()
 _cancel_event = threading.Event()
 _active_thread: threading.Thread | None = None
+_active_task_dir: Path | None = None
 
 
 def emit(event_type: str, **payload: Any) -> None:
@@ -74,6 +92,16 @@ def read_json(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def run_metadata_path(run_dir: Path) -> Path:
@@ -223,7 +251,12 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             if existing_screenshot:
                 row["screenshot_path"] = existing_screenshot
             row["speech_text"] = existing_speech or page_speech_text(page)
-            row["status"] = "detected"
+            row["status"] = (
+                "failed"
+                if page.get("failure_stage") == "asr"
+                or page.get("transcription_status") == "failed"
+                else "detected"
+            )
     if evaluation:
         for page in evaluation.get("pages", []):
             if not isinstance(page, Mapping) or "page_id" not in page:
@@ -245,6 +278,8 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             row["status"] = (
                 "failed" if page.get("status") == "failed" else "completed"
             )
+            if row["status"] == "failed" and not row.get("failure_stage"):
+                row["failure_stage"] = "llm"
     try:
         updated_at = (run_dir / "result.json").stat().st_mtime * 1000
     except OSError:
@@ -252,12 +287,21 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
     elapsed = load_run_elapsed(run_dir)
     evaluation_summary = evaluation.get("summary", {}) if evaluation else {}
     failed_pages = int(evaluation_summary.get("failed_pages") or 0)
+    asr_failed_pages = int(
+        (
+            transcript.get("transcription", {})
+            .get("cloud_statistics", {})
+            .get("failed_page_count", 0)
+        )
+        if transcript
+        else 0
+    )
     evaluation_complete = evaluation_summary.get("complete")
     metadata_status = str(metadata.get("status") or "")
     completed_with_errors = bool(
         evaluation
         and (failed_pages > 0 or evaluation_complete is False)
-    ) or metadata_status == "completed_with_errors"
+    ) or asr_failed_pages > 0 or metadata_status == "completed_with_errors"
     if completed_with_errors:
         task_status = "completed_with_errors"
     elif metadata_status == "completed" or evaluation:
@@ -345,6 +389,450 @@ def list_tasks(output_root: str | None = None) -> list[dict[str, Any]]:
         key=lambda item: float(item.get("updated_at") or 0),
         reverse=True,
     )[:30]
+
+
+def task_roots(output_root: str | None = None) -> list[Path]:
+    candidates = [
+        Path(output_root) if output_root else None,
+        project_root() / "output",
+        Path.home() / "Documents" / "课堂PPT处理结果",
+    ]
+    roots: list[Path] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        resolved = candidate.expanduser().resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def resolve_existing_task_dir(
+    task_id: str,
+    output_root: str | None = None,
+) -> Path:
+    candidate = Path(task_id).expanduser().resolve()
+    if not any(candidate.parent == root for root in task_roots(output_root)):
+        raise ValueError("任务目录不在允许的结果目录中。")
+    if not candidate.is_dir() or load_task(candidate) is None:
+        raise FileNotFoundError("任务结果不存在或已经被删除。")
+    return candidate
+
+
+def delete_task_result(task_id: str, output_root: str | None = None) -> Path:
+    run_dir = resolve_existing_task_dir(task_id, output_root)
+    with _task_lock:
+        is_actively_running = bool(
+            _active_thread is not None
+            and _active_thread.is_alive()
+            and _active_task_dir == run_dir
+        )
+    if is_actively_running:
+        raise RuntimeError("正在处理或重试的任务不能删除。")
+    shutil.rmtree(run_dir)
+    return run_dir
+
+
+def _write_retry_evaluation(
+    *,
+    run_dir: Path,
+    transcript: Mapping[str, Any],
+    previous: Mapping[str, Any],
+    config: LLMEvaluationConfig,
+    pages: list[dict[str, Any]],
+    retry_elapsed: float,
+) -> dict[str, Any]:
+    destination = run_dir / "llm_evaluation"
+    result_path = destination / "llm_evaluation.json"
+    artifacts = dict(previous.get("artifacts", {}))
+    report_path = Path(
+        str(artifacts.get("report_markdown") or destination / "PPT讲话关联度报告.md")
+    )
+    artifacts.update(
+        {
+            "result_json": result_path.resolve().as_posix(),
+            "report_markdown": report_path.resolve().as_posix(),
+            "page_results_dir": (destination / "pages").resolve().as_posix(),
+        }
+    )
+    payload: dict[str, Any] = {
+        **dict(previous),
+        "video_id": str(transcript.get("video_id") or run_dir.name),
+        "transcript_path": (run_dir / "transcript.json").resolve().as_posix(),
+        "model": config.model,
+        "base_url": config.base_url,
+        "prompt_version": PROMPT_VERSION,
+        "processing_duration_sec": round(
+            float(previous.get("processing_duration_sec") or 0) + retry_elapsed,
+            3,
+        ),
+        "summary": summarize_evaluations(pages),
+        "pages": pages,
+        "config": {
+            key: value
+            for key, value in asdict(config).items()
+            if key != "api_key_env"
+        },
+        "artifacts": artifacts,
+    }
+    write_json(result_path, payload)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(render_evaluation_markdown(payload), encoding="utf-8")
+    return payload
+
+
+def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
+    global _active_task_dir
+    started_at = time.perf_counter()
+    task_id = str(payload.get("task_id") or "")
+    run_dir: Path | None = None
+    previous_metadata_status = "completed_with_errors"
+    try:
+        run_dir = resolve_existing_task_dir(
+            task_id,
+            str(payload.get("output_root") or "") or None,
+        )
+        with _task_lock:
+            _active_task_dir = run_dir
+        task_id = str(run_dir.resolve())
+        transcript_path = run_dir / "transcript.json"
+        transcript = read_json(transcript_path)
+        evaluation_path = run_dir / "llm_evaluation" / "llm_evaluation.json"
+        evaluation = read_json(evaluation_path) or {}
+        metadata = read_json(run_metadata_path(run_dir)) or {}
+        previous_metadata_status = str(
+            metadata.get("status") or "completed_with_errors"
+        )
+        if not transcript or not isinstance(transcript.get("pages"), list):
+            raise ValueError("该任务没有可供单页重试的转写结果。")
+
+        failed_by_id: dict[int, dict[str, Any]] = {}
+        for page in transcript.get("pages", []):
+            if (
+                isinstance(page, Mapping)
+                and page.get("failure_stage") == "asr"
+                and "page_id" in page
+            ):
+                failed_by_id[int(page["page_id"])] = dict(page)
+        for item in evaluation.get("pages", []):
+            if not isinstance(item, Mapping) or item.get("status") != "failed":
+                continue
+            page_id = int(item["page_id"])
+            merged = dict(failed_by_id.get(page_id, {}))
+            merged.update(dict(item))
+            merged.setdefault("failure_stage", "llm")
+            failed_by_id[page_id] = merged
+
+        requested = payload.get("page_ids")
+        if isinstance(requested, list) and requested:
+            target_ids = sorted({int(value) for value in requested})
+            invalid = [page_id for page_id in target_ids if page_id not in failed_by_id]
+            if invalid:
+                raise ValueError(f"以下页面当前不是失败状态：{invalid}")
+        else:
+            target_ids = sorted(failed_by_id)
+        if not target_ids:
+            raise ValueError("该任务目前没有需要重试的失败页面。")
+
+        settings = payload.get("settings", {})
+        if not isinstance(settings, Mapping):
+            raise ValueError("桌面端设置格式不正确。")
+        metadata["status"] = "retrying"
+        write_json(run_metadata_path(run_dir), metadata)
+        emit("task.retry_started", task_id=task_id, page_ids=target_ids)
+
+        transcript_pages = {
+            int(page["page_id"]): dict(page)
+            for page in transcript["pages"]
+            if isinstance(page, Mapping) and "page_id" in page
+        }
+        asr_target_ids = [
+            page_id
+            for page_id in target_ids
+            if failed_by_id[page_id].get("failure_stage") == "asr"
+        ]
+        llm_target_ids = [
+            page_id
+            for page_id in target_ids
+            if failed_by_id[page_id].get("failure_stage") != "asr"
+        ]
+
+        if asr_target_ids:
+            if not bool(payload.get("asr_upload_consent")):
+                raise ValueError("请确认允许重新发送失败页的临时音频。")
+            asr_config = transcription_config(settings)
+            if asr_config.engine != "mimo-cloud":
+                raise ValueError("云端 ASR 失败页重试需要选择 ASR 模型服务。")
+            asr_key = resolve_mimo_api_key(
+                asr_config.mimo_api_key_env,
+                str(payload.get("asr_api_key") or ""),
+            )
+            video_path = Path(str(transcript.get("video_path") or ""))
+            if not video_path.is_file():
+                raise FileNotFoundError("原始视频不存在，无法重试语音识别。")
+            asr_settings = MimoASRSettings(
+                base_url=asr_config.mimo_base_url,
+                model=asr_config.mimo_model,
+                language=asr_config.mimo_language,
+                max_concurrency=1,
+                max_chunk_duration_sec=asr_config.mimo_max_chunk_duration_sec,
+                timeout_sec=asr_config.mimo_timeout_sec,
+                max_retries=asr_config.mimo_max_retries,
+                ffmpeg_path=asr_config.ffmpeg_path,
+            )
+            activity_lock = threading.Lock()
+            active_asr = 0
+
+            def retry_asr(page_id: int) -> tuple[int, dict[str, Any]]:
+                nonlocal active_asr
+                require_not_cancelled()
+                with activity_lock:
+                    active_asr += 1
+                    emit(
+                        "cloud.activity",
+                        task_id=task_id,
+                        active_cloud_requests=active_asr,
+                        cloud_limit=asr_config.mimo_max_concurrency,
+                    )
+                try:
+                    pages, _ = transcribe_pages_with_mimo(
+                        video_path,
+                        [transcript_pages[page_id]],
+                        settings=asr_settings,
+                        api_key=asr_key,
+                    )
+                    return page_id, pages[0]
+                finally:
+                    with activity_lock:
+                        active_asr = max(0, active_asr - 1)
+                        emit(
+                            "cloud.activity",
+                            task_id=task_id,
+                            active_cloud_requests=active_asr,
+                            cloud_limit=asr_config.mimo_max_concurrency,
+                        )
+
+            with ThreadPoolExecutor(
+                max_workers=min(asr_config.mimo_max_concurrency, len(asr_target_ids)),
+                thread_name_prefix="retry-page-asr",
+            ) as executor:
+                futures = {
+                    executor.submit(retry_asr, page_id): page_id
+                    for page_id in asr_target_ids
+                }
+                for future in as_completed(futures):
+                    page_id = futures[future]
+                    try:
+                        _, result = future.result()
+                        result.pop("failure_stage", None)
+                        result.pop("reason", None)
+                        result["transcription_status"] = "completed"
+                        transcript_pages[page_id] = result
+                        if evaluation:
+                            llm_target_ids.append(page_id)
+                        emit_page(
+                            result,
+                            "scoring" if evaluation else "completed",
+                            task_id=task_id,
+                        )
+                    except Exception as exc:
+                        failed = transcript_pages[page_id]
+                        failed.update(
+                            {
+                                "speech_text": "",
+                                "utterances": [],
+                                "transcription_status": "failed",
+                                "failure_stage": "asr",
+                                "reason": str(exc),
+                            }
+                        )
+                        emit_page(
+                            failed,
+                            "failed",
+                            task_id=task_id,
+                            failure_stage="asr",
+                            reason=str(exc),
+                        )
+
+            ordered_transcripts = [
+                transcript_pages[key] for key in sorted(transcript_pages)
+            ]
+            transcript["pages"] = ordered_transcripts
+            transcript["config"] = asdict(asr_config)
+            transcript.setdefault("transcription", {})["model"] = asr_config.mimo_model
+            transcript["transcription"]["utterance_count"] = sum(
+                len(page.get("utterances", [])) for page in ordered_transcripts
+            )
+            cloud_statistics = transcript["transcription"].setdefault(
+                "cloud_statistics", {}
+            )
+            cloud_statistics["failed_page_count"] = sum(
+                page.get("failure_stage") == "asr" for page in ordered_transcripts
+            )
+            cloud_statistics["retry_request_count"] = int(
+                cloud_statistics.get("retry_request_count", 0)
+            ) + len(asr_target_ids)
+            write_json(transcript_path, transcript)
+            transcript_markdown = Path(
+                str(
+                    transcript.get("artifacts", {}).get("page_transcript_markdown")
+                    or run_dir / "逐页语音文字.md"
+                )
+            )
+            transcript_markdown.write_text(
+                render_page_transcripts_markdown(
+                    str(transcript.get("video_id") or run_dir.name),
+                    ordered_transcripts,
+                ),
+                encoding="utf-8",
+            )
+
+        if llm_target_ids:
+            if not bool(payload.get("llm_upload_consent")):
+                raise ValueError("请确认允许重新发送失败页截图和课堂转写。")
+            llm_settings = llm_config(settings)
+            llm_key = str(payload.get("llm_api_key") or "").strip()
+            llm_key = llm_key or os.environ.get("LLM_API_KEY", "").strip()
+            if not llm_key:
+                raise ValueError("没有找到 LLM API Key。")
+            evaluation_pages = {
+                int(item["page_id"]): dict(item)
+                for item in evaluation.get("pages", [])
+                if isinstance(item, Mapping) and "page_id" in item
+            }
+            activity_lock = threading.Lock()
+            active_llm = 0
+
+            def retry_llm(page_id: int) -> tuple[int, dict[str, Any]]:
+                nonlocal active_llm
+                require_not_cancelled()
+                with activity_lock:
+                    active_llm += 1
+                    emit(
+                        "cloud.activity",
+                        task_id=task_id,
+                        active_cloud_requests=active_llm,
+                        cloud_limit=llm_settings.max_concurrency,
+                    )
+                try:
+                    result = evaluate_page(
+                        transcript_pages[page_id],
+                        transcript_path=transcript_path,
+                        config=llm_settings,
+                        output_dir=run_dir / "llm_evaluation",
+                        api_key=llm_key,
+                    )
+                    if result.get("status") == "failed":
+                        result["failure_stage"] = "llm"
+                    return page_id, result
+                finally:
+                    with activity_lock:
+                        active_llm = max(0, active_llm - 1)
+                        emit(
+                            "cloud.activity",
+                            task_id=task_id,
+                            active_cloud_requests=active_llm,
+                            cloud_limit=llm_settings.max_concurrency,
+                        )
+
+            unique_llm_ids = sorted(set(llm_target_ids))
+            with ThreadPoolExecutor(
+                max_workers=min(llm_settings.max_concurrency, len(unique_llm_ids)),
+                thread_name_prefix="retry-page-llm",
+            ) as executor:
+                futures = {
+                    executor.submit(retry_llm, page_id): page_id
+                    for page_id in unique_llm_ids
+                }
+                for future in as_completed(futures):
+                    page_id = futures[future]
+                    try:
+                        _, result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "page_id": page_id,
+                            "start_sec": transcript_pages[page_id].get("start_sec", 0),
+                            "end_sec": transcript_pages[page_id].get("end_sec", 0),
+                            "status": "failed",
+                            "failure_stage": "llm",
+                            "speech_relevance": 0,
+                            "ppt_coverage": 0,
+                            "evidence_consistency": 0,
+                            "score": 0,
+                            "level": "请求失败",
+                            "reason": str(exc),
+                        }
+                    evaluation_pages[page_id] = result
+                    kwargs = {
+                        "score": result.get("score"),
+                        "level": result.get("level"),
+                        "reason": result.get("reason"),
+                        "failure_stage": result.get("failure_stage"),
+                    }
+                    if "matched_evidence" in result:
+                        kwargs["evidence"] = result.get("matched_evidence")
+                    emit_page(
+                        transcript_pages[page_id],
+                        "failed" if result.get("status") == "failed" else "completed",
+                        task_id=task_id,
+                        **kwargs,
+                    )
+            ordered_evaluations = [
+                evaluation_pages[key] for key in sorted(evaluation_pages)
+            ]
+            evaluation = _write_retry_evaluation(
+                run_dir=run_dir,
+                transcript=transcript,
+                previous=evaluation,
+                config=llm_settings,
+                pages=ordered_evaluations,
+                retry_elapsed=time.perf_counter() - started_at,
+            )
+
+        retry_elapsed = round(time.perf_counter() - started_at, 3)
+        metadata = read_json(run_metadata_path(run_dir)) or metadata
+        metadata["elapsed_sec"] = round(
+            float(metadata.get("elapsed_sec") or 0) + retry_elapsed,
+            3,
+        )
+        metadata["completed_at"] = time.time()
+        asr_failed = sum(
+            page.get("failure_stage") == "asr"
+            for page in transcript.get("pages", [])
+            if isinstance(page, Mapping)
+        )
+        llm_failed = int(
+            evaluation.get("summary", {}).get("failed_pages", 0)
+            if evaluation
+            else 0
+        )
+        metadata["status"] = (
+            "completed_with_errors" if asr_failed or llm_failed else "completed"
+        )
+        write_json(run_metadata_path(run_dir), metadata)
+        task = load_task(run_dir)
+        emit(
+            "task.retry_completed",
+            task_id=task_id,
+            page_ids=target_ids,
+            result=task,
+        )
+    except Exception as exc:
+        if run_dir is not None:
+            metadata = read_json(run_metadata_path(run_dir)) or {}
+            metadata["status"] = previous_metadata_status
+            write_json(run_metadata_path(run_dir), metadata)
+        emit(
+            "task.retry_failed",
+            task_id=task_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+    finally:
+        with _task_lock:
+            if run_dir is not None and _active_task_dir == run_dir.resolve():
+                _active_task_dir = None
+        _cancel_event.clear()
 
 
 def require_not_cancelled() -> None:
@@ -443,6 +931,7 @@ def emit_page(
 
 
 def run_task(payload: Mapping[str, Any]) -> None:
+    global _active_task_dir
     started_at = time.perf_counter()
     cloud_pipeline: CloudPagePipeline | None = None
     task_id = ""
@@ -461,6 +950,8 @@ def run_task(payload: Mapping[str, Any]) -> None:
         if not isinstance(settings, Mapping):
             raise ValueError("桌面端设置格式不正确。")
         run_dir = resolve_run_directory(output_root, video_id)
+        with _task_lock:
+            _active_task_dir = run_dir.resolve()
         result_path = run_dir / "result.json"
         transcript_path = run_dir / "transcript.json"
         evaluation_dir = run_dir / "llm_evaluation"
@@ -474,7 +965,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             video_path=str(video.resolve()),
             run_dir=str(run_dir.resolve()),
             started_at=time.time(),
-            algorithm_version="1.4.1",
+            algorithm_version="1.4.3",
             streaming_page_confirmation=True,
             mode=mode,
             include_llm=include_llm,
@@ -543,6 +1034,17 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     page = cloud_pipeline._page_transcripts.get(page_id)
                     if page:
                         emit_page(page, "scoring" if include_llm else "completed", task_id=task_id)
+                    elif page_id in cloud_pipeline._asr_errors:
+                        failed_page = cloud_pipeline._submitted_pages.get(
+                            page_id, {"page_id": page_id}
+                        )
+                        emit_page(
+                            failed_page,
+                            "failed",
+                            task_id=task_id,
+                            failure_stage="asr",
+                            reason=str(cloud_pipeline._asr_errors[page_id]),
+                        )
                 elif stage == "LLM关联度评分":
                     evaluation = cloud_pipeline._evaluations.get(page_id)
                     transcript = cloud_pipeline._page_transcripts.get(
@@ -554,10 +1056,18 @@ def run_task(payload: Mapping[str, Any]) -> None:
                             level=evaluation.get("level"),
                             reason=evaluation.get("reason"),
                         )
+                        failed = evaluation.get("status") == "failed"
+                        if failed:
+                            kwargs["failure_stage"] = "llm"
                         matched = evaluation.get("matched_evidence")
                         if matched is not None:
                             kwargs["evidence"] = matched
-                        emit_page(transcript, "completed", task_id=task_id, **kwargs)
+                        emit_page(
+                            transcript,
+                            "failed" if failed else "completed",
+                            task_id=task_id,
+                            **kwargs,
+                        )
 
             cloud_pipeline = CloudPagePipeline(
                 video_path=video,
@@ -722,12 +1232,24 @@ def run_task(payload: Mapping[str, Any]) -> None:
             meta["elapsed_sec"] = elapsed_sec
             meta["completed_at"] = time.time()
             evaluation_summary = evaluation.get("summary", {}) if evaluation else {}
+            asr_failed_pages = int(
+                (
+                    transcript.get("transcription", {})
+                    .get("cloud_statistics", {})
+                    .get("failed_page_count", 0)
+                )
+                if transcript
+                else 0
+            )
             meta["status"] = (
                 "completed_with_errors"
-                if evaluation
-                and (
-                    int(evaluation_summary.get("failed_pages") or 0) > 0
-                    or evaluation_summary.get("complete") is False
+                if asr_failed_pages > 0
+                or (
+                    evaluation
+                    and (
+                        int(evaluation_summary.get("failed_pages") or 0) > 0
+                        or evaluation_summary.get("complete") is False
+                    )
                 )
                 else "completed"
             )
@@ -768,6 +1290,9 @@ def run_task(payload: Mapping[str, Any]) -> None:
             traceback=traceback.format_exc(),
         )
     finally:
+        with _task_lock:
+            if run_dir is not None and _active_task_dir == run_dir.resolve():
+                _active_task_dir = None
         _cancel_event.clear()
 
 
@@ -787,13 +1312,33 @@ def start_task(payload: Mapping[str, Any]) -> None:
         _active_thread.start()
 
 
+def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
+    global _active_thread
+    with _task_lock:
+        if _active_thread is not None and _active_thread.is_alive():
+            emit(
+                "task.retry_failed",
+                task_id=str(payload.get("task_id") or ""),
+                error="已有任务正在处理中，请稍后再重试。",
+            )
+            return
+        _cancel_event.clear()
+        _active_thread = threading.Thread(
+            target=run_retry_failed_pages,
+            args=(dict(payload),),
+            daemon=True,
+            name="desktop-v2-page-retry",
+        )
+        _active_thread.start()
+
+
 def handle_command(command: Mapping[str, Any]) -> None:
     action = str(command.get("action") or "")
     if action == "ping":
         emit(
             "worker.ready",
             project_root=str(project_root()),
-            algorithm_version="1.4.1",
+            algorithm_version="1.4.3",
             ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
             ffprobe_path=bundled_tool("ffprobe") or "PATH",
         )
@@ -811,6 +1356,22 @@ def handle_command(command: Mapping[str, Any]) -> None:
             "tasks.list",
             tasks=list_tasks(str(command.get("output_root") or "") or None),
         )
+    elif action == "delete_task":
+        task_id = str(command.get("task_id") or "")
+        try:
+            delete_task_result(
+                task_id,
+                str(command.get("output_root") or "") or None,
+            )
+            emit("task.deleted", task_id=task_id)
+        except Exception as exc:
+            emit("task.delete_failed", task_id=task_id, error=str(exc))
+    elif action == "retry_failed_pages":
+        payload = command.get("payload", {})
+        if not isinstance(payload, Mapping):
+            emit("task.retry_failed", error="重试参数格式不正确。")
+            return
+        start_retry_failed_pages(payload)
     else:
         emit("worker.log", message=f"未知桌面端命令：{action}")
 
@@ -823,7 +1384,7 @@ def main() -> int:
     emit(
         "worker.ready",
         project_root=str(project_root()),
-        algorithm_version="1.4.1",
+        algorithm_version="1.4.3",
         ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
         ffprobe_path=bundled_tool("ffprobe") or "PATH",
     )

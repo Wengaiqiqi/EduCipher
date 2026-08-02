@@ -251,7 +251,7 @@ class CloudPagePipelineTests(unittest.TestCase):
                 (root / "llm_evaluation" / "llm_evaluation.json").is_file()
             )
 
-    def test_asr_failure_stops_finalization(self) -> None:
+    def test_asr_failure_is_persisted_for_page_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video = root / "lesson.mp4"
@@ -269,6 +269,8 @@ class CloudPagePipelineTests(unittest.TestCase):
                     mimo_max_concurrency=1,
                 ),
                 asr_api_key="",
+                llm_config=LLMEvaluationConfig(max_concurrency=1),
+                llm_api_key="test-key",
                 asr_runner=failing_asr,
             )
             page = {
@@ -278,17 +280,29 @@ class CloudPagePipelineTests(unittest.TestCase):
                 "screenshot_path": str(root / "page_001.jpg"),
             }
             pipeline.submit_page(page, 1, 1)
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "第1页.*cloud unavailable",
-            ):
-                pipeline.finish(
-                    {
-                        "video_id": "lesson",
-                        "video_duration_sec": 10.0,
-                        "pages": [page],
-                    }
-                )
+            transcript, evaluation = pipeline.finish(
+                {
+                    "video_id": "lesson",
+                    "video_duration_sec": 10.0,
+                    "pages": [page],
+                }
+            )
+            self.assertIsNotNone(evaluation)
+            assert evaluation is not None
+            self.assertEqual(transcript["pages"][0]["failure_stage"], "asr")
+            self.assertEqual(
+                transcript["pages"][0]["transcription_status"], "failed"
+            )
+            self.assertIn("cloud unavailable", transcript["pages"][0]["reason"])
+            self.assertEqual(
+                transcript["transcription"]["cloud_statistics"][
+                    "failed_page_count"
+                ],
+                1,
+            )
+            self.assertEqual(evaluation["pages"][0]["status"], "failed")
+            self.assertEqual(evaluation["pages"][0]["failure_stage"], "asr")
+            self.assertEqual(evaluation["summary"]["failed_pages"], 1)
 
 
 if __name__ == "__main__":

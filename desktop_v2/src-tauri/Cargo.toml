@@ -1,6 +1,6 @@
 [package]
 name = "kexi-desktop"
-version = "2.0.4"
+version = "2.0.7"
 description = "课析 - 课堂视频与 PPT 智能分析桌面端"
 authors = ["Kexi"]
 edition = "2021"

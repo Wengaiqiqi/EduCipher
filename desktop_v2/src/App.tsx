@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
   BarChart3,
@@ -26,11 +26,13 @@ import {
   PanelLeftClose,
   Play,
   Plus,
+  RotateCcw,
   Settings,
   Sparkles,
   Square,
   Sun,
   Timer,
+  Trash2,
   Video,
   WandSparkles,
   X,
@@ -287,7 +289,17 @@ function PageCard({
   );
 }
 
-function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: () => void; settings?: AppSettings }) {
+function ReportViewer({
+  task,
+  onClose,
+  onRetryPage,
+  settings,
+}: {
+  task: TaskRecord;
+  onClose: () => void;
+  onRetryPage?: (page: PageRecord) => void;
+  settings?: AppSettings;
+}) {
   const score = overallScore(task);
   const coverage = Number(task.summary?.speech_page_coverage_percent ?? 0);
   const [pageIndex, setPageIndex] = useState(0);
@@ -320,6 +332,11 @@ function ReportViewer({ task, onClose, settings }: { task: TaskRecord; onClose: 
               <strong>第 {page.page_id} 页</strong>
               <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
               {page.score != null && <b>{Math.round(page.score)}分</b>}
+              {page.status === "failed" && onRetryPage && (
+                <button className="button retry-button" onClick={() => onRetryPage(page)}>
+                  <RotateCcw size={15} />重试本页
+                </button>
+              )}
             </div>
             <div className="report-viewer-page-score">
               <i style={{ width: `${page.score || 0}%` }} />
@@ -381,10 +398,12 @@ function Inspector({
   page,
   task,
   settings,
+  onRetryPage,
 }: {
   page?: PageRecord;
   task?: TaskRecord;
   settings?: AppSettings;
+  onRetryPage?: (page: PageRecord) => void;
 }) {
   const evidenceEnabled = task?.include_evidence ?? settings?.include_evidence ?? false;
   return (
@@ -458,6 +477,12 @@ function Inspector({
               <h4 style={{ margin: "0 0 8px", fontSize: 14, color: "var(--text)" }}>对应证据</h4>
               <p>该页面没有匹配到对应证据。</p>
             </div>
+          )}
+          {page?.status === "failed" && task?.status !== "running" && onRetryPage && (
+            <button className="button retry-button inspector-retry" onClick={() => onRetryPage(page)}>
+              <RotateCcw size={16} />
+              {page.failure_stage === "asr" ? "重试本页语音识别" : "重试本页关联度评分"}
+            </button>
           )}
         </section>
       </div>
@@ -667,7 +692,17 @@ function NewTaskModal({
   );
 }
 
-function ReportsView({ tasks, onOpenReport }: { tasks: TaskRecord[]; onOpenReport: (task: TaskRecord) => void }) {
+function ReportsView({
+  tasks,
+  onOpenReport,
+  onDelete,
+  onRetryFailed,
+}: {
+  tasks: TaskRecord[];
+  onOpenReport: (task: TaskRecord) => void;
+  onDelete: (task: TaskRecord) => void;
+  onRetryFailed: (task: TaskRecord) => void;
+}) {
   const completed = tasks.filter((task) => task.status === "completed" || task.status === "completed_with_errors");
   const scores = completed
     .map((task) => overallScore(task))
@@ -692,7 +727,17 @@ function ReportsView({ tasks, onOpenReport }: { tasks: TaskRecord[]; onOpenRepor
               <div className="report-icon"><FileText size={20} /></div>
               <div><strong>{task.video_id}</strong><span>{task.pages.length} 页 PPT · {task.model || "关联度模型"}</span></div>
               <div className="report-score">{score != null ? Math.round(score) : "—"}<small>分</small></div>
-              <button className="button secondary" onClick={() => onOpenReport(task)}>打开报告</button>
+              <div className="report-actions">
+                {task.status === "completed_with_errors" && (
+                  <button className="button retry-button" onClick={() => onRetryFailed(task)}>
+                    <RotateCcw size={15} />重试失败页
+                  </button>
+                )}
+                <button className="button secondary" onClick={() => onOpenReport(task)}>打开报告</button>
+                <button className="icon-button danger-button" title="删除报告及任务" onClick={() => onDelete(task)}>
+                  <Trash2 size={16} />
+                </button>
+              </div>
             </div>
           );
         })}
@@ -836,7 +881,14 @@ export default function App() {
             if (task.status !== "running") return task;
             const exists = task.pages.some((page) => page.page_id === data.page!.page_id);
             const pages = exists
-              ? task.pages.map((page) => page.page_id === data.page!.page_id ? { ...page, ...data.page } : page)
+              ? task.pages.map((page) => {
+                if (page.page_id !== data.page!.page_id) return page;
+                const merged = { ...page, ...data.page };
+                if (data.page!.status === "scoring" || data.page!.status === "completed") {
+                  delete merged.failure_stage;
+                }
+                return merged;
+              })
               : [...task.pages, data.page!].sort((a, b) => a.page_id - b.page_id);
             return { ...task, pages };
           }),
@@ -851,6 +903,41 @@ export default function App() {
         setError(data.error || "任务处理失败。");
         setCloudActive(0);
         setTasks((current) => current.map((task) => (task.id === (data.task_id || task.id) && task.status === "running") ? { ...task, status: "failed", stage: "处理失败" } : task));
+      } else if (data.type === "task.retry_started") {
+        const retryIds = new Set(data.page_ids || []);
+        setError("");
+        setTasks((current) => current.map((task) => task.id === data.task_id ? {
+          ...task,
+          status: "running",
+          stage: "正在重试失败页",
+          message: `正在重试 ${retryIds.size} 个失败页`,
+          pages: task.pages.map((page) => retryIds.has(page.page_id) ? {
+            ...page,
+            status: page.failure_stage === "asr" ? "transcribing" : "scoring",
+          } : page),
+        } : task));
+      } else if (data.type === "task.retry_completed" && data.result) {
+        const result = data.result;
+        setTasks((current) => [result, ...current.filter((task) => task.id !== result.id)]);
+        setActiveTaskId(result.id);
+        setReportTask((current) => current?.id === result.id ? result : current);
+        setCloudActive(0);
+      } else if (data.type === "task.retry_failed") {
+        setError(data.error || "失败页重试未能完成。");
+        setCloudActive(0);
+        setTasks((current) => current.map((task) => task.id === data.task_id ? {
+          ...task,
+          status: "completed_with_errors",
+          stage: "重试失败",
+          message: data.error || "失败页重试未能完成。",
+        } : task));
+      } else if (data.type === "task.deleted") {
+        setTasks((current) => current.filter((task) => task.id !== data.task_id));
+        setActiveTaskId((active) => active === data.task_id ? "" : active);
+        setSelectedPageId(null);
+        setReportTask((current) => current?.id === data.task_id ? null : current);
+      } else if (data.type === "task.delete_failed") {
+        setError(data.error || "删除任务失败。");
       }
     }).then(async (dispose) => {
       if (disposed) {
@@ -925,6 +1012,74 @@ export default function App() {
     }
   }
 
+  async function deleteTask(task: TaskRecord) {
+    if (task.status === "running") {
+      setError("正在处理或重试的任务不能删除。");
+      return;
+    }
+    const confirmed = await confirmDialog(
+      `确定删除“${task.video_id}”吗？任务结果、转写和分析报告都会一并删除，且无法恢复。`,
+      { title: "删除任务", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
+    );
+    if (!confirmed) return;
+    setError("");
+    try {
+      await sendWorker({
+        action: "delete_task",
+        task_id: task.id,
+        output_root: settings.output_root,
+      });
+    } catch (reason) {
+      setError(`无法删除任务：${String(reason)}`);
+    }
+  }
+
+  async function retryFailedPages(task: TaskRecord, pageIds?: number[]) {
+    if (tasks.some((item) => item.status === "running")) {
+      setError("已有任务正在处理，请完成后再重试失败页。");
+      return;
+    }
+    const failed = task.pages.filter((page) => page.status === "failed");
+    const selected = pageIds?.length
+      ? failed.filter((page) => pageIds.includes(page.page_id))
+      : failed;
+    if (!selected.length) {
+      setError("没有找到可重试的失败页面。");
+      return;
+    }
+    const asrCount = selected.filter((page) => page.failure_stage === "asr").length;
+    const llmCount = selected.length - asrCount;
+    const description = [
+      asrCount ? `${asrCount} 页语音识别` : "",
+      llmCount ? `${llmCount} 页关联度评分` : "",
+    ].filter(Boolean).join("、");
+    const confirmed = await confirmDialog(
+      `将重试${description}。重试时只会重新发送这些失败页所需的音频、PPT 截图和转写内容，是否继续？`,
+      { title: "重试失败页", kind: "warning", okLabel: "继续重试", cancelLabel: "取消" },
+    );
+    if (!confirmed) return;
+    setError("");
+    setNav("tasks");
+    setActiveTaskId(task.id);
+    try {
+      await sendWorker({
+        action: "retry_failed_pages",
+        payload: {
+          task_id: task.id,
+          output_root: settings.output_root,
+          page_ids: pageIds,
+          settings,
+          asr_api_key: settings.asr_api_key,
+          llm_api_key: settings.llm_api_key,
+          asr_upload_consent: true,
+          llm_upload_consent: true,
+        },
+      });
+    } catch (reason) {
+      setError(`无法启动失败页重试：${String(reason)}`);
+    }
+  }
+
   const recentTasks = useMemo(() => tasks.filter((t) => t.pages.length > 0 || t.status === "running").slice(0, 8), [tasks]);
 
   return (
@@ -977,32 +1132,38 @@ export default function App() {
         <div className="recent-header"><span>最近任务</span><ChevronDown size={14} /></div>
         <div className="recent-list">
           {recentTasks.map((task) => (
-            <button
-              key={task.id}
-              className={task.id === activeTask?.id ? "active" : ""}
-              onClick={() => {
-                setActiveTaskId(task.id);
-                setNav("tasks");
-              }}
-            >
-              <div className="recent-thumb">
-                {task.pages[0] ? <SlideImage page={task.pages[0]} compact /> : <ImageIcon size={18} />}
-              </div>
-              <div>
-                <strong>{task.video_id}</strong>
-                <span>
-                  {task.status === "running"
-                    ? "正在处理"
-                    : task.status === "completed_with_errors"
-                      ? `${task.pages.length} 页 · 存在错误`
-                      : `${task.pages.length} 页`}
-                  {task.elapsed_sec != null && task.elapsed_sec > 0
-                    ? ` · ${formatTime(task.elapsed_sec)}`
-                    : ""}
-                </span>
-              </div>
-              {task.status === "running" && <i className="task-dot" />}
-            </button>
+            <div className="recent-task-row" key={task.id}>
+              <button
+                className={`recent-task-main ${task.id === activeTask?.id ? "active" : ""}`}
+                onClick={() => {
+                  setActiveTaskId(task.id);
+                  setNav("tasks");
+                }}
+              >
+                <div className="recent-thumb">
+                  {task.pages[0] ? <SlideImage page={task.pages[0]} compact /> : <ImageIcon size={18} />}
+                </div>
+                <div>
+                  <strong>{task.video_id}</strong>
+                  <span>
+                    {task.status === "running"
+                      ? "正在处理"
+                      : task.status === "completed_with_errors"
+                        ? `${task.pages.length} 页 · 存在错误`
+                        : `${task.pages.length} 页`}
+                    {task.elapsed_sec != null && task.elapsed_sec > 0
+                      ? ` · ${formatTime(task.elapsed_sec)}`
+                      : ""}
+                  </span>
+                </div>
+                {task.status === "running" && <i className="task-dot" />}
+              </button>
+              {task.status !== "running" && (
+                <button className="recent-delete" title="删除任务" onClick={() => void deleteTask(task)}>
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
           ))}
           {!recentTasks.length && <div className="no-recent">还没有处理记录</div>}
         </div>
@@ -1012,7 +1173,12 @@ export default function App() {
       </aside>
 
       {nav === "reports" ? (
-        <ReportsView tasks={tasks} onOpenReport={(t) => setReportTask(t)} />
+        <ReportsView
+          tasks={tasks}
+          onOpenReport={(t) => setReportTask(t)}
+          onDelete={(t) => void deleteTask(t)}
+          onRetryFailed={(t) => void retryFailedPages(t)}
+        />
       ) : (
         <>
           <main className="workspace">
@@ -1059,6 +1225,11 @@ export default function App() {
                     <Activity size={16} />
                     <span>{activeTask.message || activeTask.stage || "已加载历史处理结果"}</span>
                   </div>
+                  {failedPages > 0 && activeTask.status !== "running" && (
+                    <button className="retry-button" onClick={() => void retryFailedPages(activeTask)}>
+                      <RotateCcw size={15} />一键重试 {failedPages} 个失败页
+                    </button>
+                  )}
                 </div>
                 {error && <div className="task-error"><XCircle size={17} /><span>{error}</span><button onClick={() => setError("")}>关闭</button></div>}
                 <div className="page-list">
@@ -1081,7 +1252,12 @@ export default function App() {
               </section>
             )}
           </main>
-          <Inspector page={selectedPage} task={activeTask} settings={settings} />
+          <Inspector
+            page={selectedPage}
+            task={activeTask}
+            settings={settings}
+            onRetryPage={(page) => activeTask && void retryFailedPages(activeTask, [page.page_id])}
+          />
         </>
       )}
 
@@ -1094,7 +1270,14 @@ export default function App() {
         <div><Activity size={16} className="pulse" /><span>{activeTask?.status === "running" ? "服务活动中" : "服务待命"}</span></div>
       </footer>
 
-      {reportTask && <ReportViewer task={reportTask} settings={settings} onClose={() => setReportTask(null)} />}
+      {reportTask && (
+        <ReportViewer
+          task={reportTask}
+          settings={settings}
+          onClose={() => setReportTask(null)}
+          onRetryPage={(page) => void retryFailedPages(reportTask, [page.page_id])}
+        />
+      )}
       {showSettings && <SettingsModal settings={settings} onSave={saveSettings} onClose={() => setShowSettings(false)} />}
       {showNewTask && <NewTaskModal settings={settings} onStart={startTask} onClose={() => setShowNewTask(false)} />}
     </div>

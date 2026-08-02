@@ -15,6 +15,7 @@ desktop_v2/src-tauri/target/
 models/
 dist/
 build/
+release/
 diagnostics/
 output/
 tmp/
