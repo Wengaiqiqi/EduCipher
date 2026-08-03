@@ -1,10 +1,33 @@
 :root {
   font-family:
     "Segoe UI Variable", "Microsoft YaHei UI", "PingFang SC", sans-serif;
-  color: #eef2f8;
-  background: #0f1116;
+  color: #111827;
+  background: #f3f4f6;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --bg: #f3f4f6;
+  --panel: #ffffff;
+  --panel-2: #f0f1f4;
+  --panel-3: #e5e7eb;
+  --border: #d1d5db;
+  --border-soft: #e5e7eb;
+  --text: #111827;
+  --muted: #6b7280;
+  --faint: #9ca3af;
+  --blue: #4d91ff;
+  --blue-2: #2777eb;
+  --cyan: #4bc9de;
+  --purple: #9a72f9;
+  --green: #59d895;
+  --amber: #f0ad3c;
+  --red: #ef6a73;
+  --scrollbar-track: #f1f3f6;
+  --scrollbar-thumb: #c4cad3;
+  --scrollbar-thumb-hover: #9da6b3;
+  color-scheme: light;
+}
+
+.dark {
   --bg: #0f1116;
   --panel: #15181f;
   --panel-2: #191d25;
@@ -14,16 +37,12 @@
   --text: #eef2f8;
   --muted: #8d96a8;
   --faint: #5d6574;
-  --blue: #4d91ff;
-  --blue-2: #2777eb;
-  --cyan: #4bc9de;
-  --purple: #9a72f9;
-  --green: #59d895;
-  --amber: #f0ad3c;
-  --red: #ef6a73;
   --scrollbar-track: #151a22;
   --scrollbar-thumb: #3b4352;
   --scrollbar-thumb-hover: #505b6d;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: dark;
 }
 
 * {
@@ -739,6 +758,7 @@ select:focus-visible {
 
 .page-card-retry {
   min-width: 98px;
+  height: 29px;
   padding: 6px 8px !important;
   font-size: 11px;
 }

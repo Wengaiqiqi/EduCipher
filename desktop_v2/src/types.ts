@@ -37,6 +37,7 @@ export interface TaskRecord {
     ppt?: number;
     voice?: number;
     llm?: number;
+    report?: number;
   };
   completed_stages?: Array<"ppt" | "voice" | "llm" | "report">;
   message?: string;

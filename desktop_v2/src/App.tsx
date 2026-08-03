@@ -114,7 +114,7 @@ function statusLabel(status?: PageRecord["status"]) {
   return {
     waiting: "等待处理",
     cloud_waiting: "等待云端处理",
-    retry_waiting: "等待重试",
+    retry_waiting: "准备重试",
     detected: "页面已确认",
     transcribing: "语音识别中",
     scoring: "正在评分",
@@ -213,10 +213,31 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
   const totalPages = pages.length;
   const completedStages = task?.completed_stages || [];
 
-  const pptPct = isTerminal ? 100 : Math.min(100, Math.max(0, task?.stage_progresses?.ppt || 0));
-  const voicePct = !voiceEnabled ? 0 : isTerminal ? 100 : totalPages ? Math.round((transcribed / totalPages) * 100) : 0;
-  const llmPct = !llmEnabled ? 0 : isComplete ? 100 : totalPages ? Math.round((scored / totalPages) * 100) : 0;
-  const stageRatio = isTerminal ? 100 : Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25);
+  const pptPct = isTerminal
+    ? 100
+    : Math.min(100, Math.max(0, task?.stage_progresses?.ppt ?? (completedStages.includes("ppt") ? 100 : 0)));
+  const voicePct = !voiceEnabled
+    ? 0
+    : isTerminal
+      ? 100
+      : Math.max(
+        task?.stage_progresses?.voice || 0,
+        totalPages ? Math.round((transcribed / totalPages) * 100) : 0,
+      );
+  const llmPct = !llmEnabled
+    ? 0
+    : isComplete
+      ? 100
+      : Math.max(
+        task?.stage_progresses?.llm || 0,
+        totalPages ? Math.round((scored / totalPages) * 100) : 0,
+      );
+  const reportPct = isTerminal
+    ? 100
+    : Math.max(
+      task?.stage_progresses?.report || 0,
+      Math.round(pptPct * 0.45 + voicePct * 0.30 + llmPct * 0.25),
+    );
 
   // 并发流水线会在 PPT 检测尚未结束时提前完成个别页面。
   // 阶段只有在内核明确确认 PPT 完成，且对应页面进度达到 100% 后才允许打勾。
@@ -237,7 +258,7 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
     { label: "PPT识别", active: pptActive, done: pptDone, pct: pptPct, disabled: false, failed: false },
     { label: "语音识别", active: voiceActive, done: voiceDone, pct: voicePct, disabled: !voiceEnabled, failed: false },
     { label: "关联度评分", active: llmActive, done: llmDone, pct: llmPct, disabled: !llmEnabled, failed: hasErrors && llmEnabled },
-    { label: "生成报告", active: reportActive, done: reportDone, pct: isTerminal ? 100 : stageRatio, disabled: false, failed: hasErrors },
+    { label: "生成报告", active: reportActive, done: reportDone, pct: reportPct, disabled: false, failed: hasErrors },
   ];
 
   return (
@@ -303,10 +324,6 @@ function PageCard({
         </p>
       </div>
       <div className="page-status-column">
-        <span className={`status-chip ${page.status || "waiting"}`}>
-          {statusIcon(page.status)}
-          {statusLabel(page.status)}
-        </span>
         {page.status === "failed" && onRetryPage && (
           <button
             className="button retry-button page-card-retry"
@@ -318,7 +335,13 @@ function PageCard({
             <RotateCcw size={14} />{retryQueued ? "已排队" : "单页重试"}
           </button>
         )}
-        {page.score != null ? (
+        {page.status !== "failed" && (
+          <span className={`status-chip ${page.status || "waiting"}`}>
+            {statusIcon(page.status)}
+            {statusLabel(page.status)}
+          </span>
+        )}
+        {page.status !== "failed" && page.score != null ? (
           <div className="score-badge">
             <strong>{Math.round(page.score)}</strong>
           </div>
@@ -377,7 +400,7 @@ function ReportViewer({
             <div className="report-viewer-page-head">
               <strong>第 {page.page_id} 页</strong>
               <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
-              {page.score != null && <b>{Math.round(page.score)}分</b>}
+              {page.status !== "failed" && page.score != null && <b>{Math.round(page.score)}分</b>}
               {page.status === "failed" && onRetryPage && (
                 <button className="button retry-button" onClick={() => onRetryPage(page)}>
                   <RotateCcw size={15} />重试本页
@@ -471,14 +494,14 @@ function Inspector({
         <section className="score-section">
           <h3>关联度评分</h3>
           <div className="score-overview">
-            <strong>{page?.score != null ? Math.round(page.score) : "—"}</strong>
+            <strong>{page?.status !== "failed" && page?.score != null ? Math.round(page.score) : "—"}</strong>
             <div>
               <span className="score-level">
                 <CircleDot size={13} />
-                {scoreLevel(page?.score)}
+                {scoreLevel(page?.status === "failed" ? undefined : page?.score)}
               </span>
               <div className="score-line">
-                <i style={{ width: `${page?.score || 0}%` }} />
+                <i style={{ width: `${page?.status === "failed" ? 0 : page?.score || 0}%` }} />
               </div>
               <div className="score-scale">
                 <span>0</span>
@@ -838,7 +861,7 @@ export default function App() {
   const [workerStatus, setWorkerStatus] = useState<"starting" | "ready" | "failed">("starting");
   const [algorithmVersion, setAlgorithmVersion] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">(
-    () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "dark",
+    () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "light",
   );
   const activeTask = tasks.find((task) => task.id === activeTaskId) || tasks[0];
   const selectedPage =
@@ -908,11 +931,20 @@ export default function App() {
       if (data.type === "tasks.list" && data.tasks) {
         const filtered = data.tasks.filter((t) => t.pages.length > 0 || t.status === "running");
         setTasks((current) => {
-          const running = current.filter((task) => task.status === "running");
-          const runningIds = new Set(running.map((task) => task.id));
+          const incoming = new Map(filtered.map((task) => [task.id, task]));
+          const running = current
+            .filter((task) => task.status === "running")
+            .map((task) => {
+              const refreshed = incoming.get(task.id);
+              if (!refreshed) return task;
+              incoming.delete(task.id);
+              // Keep richer live events while the worker still reports running,
+              // but accept a persisted terminal state as the recovery source.
+              return refreshed.status === "running" ? task : refreshed;
+            });
           return [
             ...running,
-            ...filtered.filter((task) => !runningIds.has(task.id)),
+            ...incoming.values(),
           ];
         });
         setActiveTaskId((current) => current || filtered[0]?.id || "");
@@ -955,6 +987,7 @@ export default function App() {
                 if (data.stage?.includes("PPT") || data.stage?.includes("页面识别")) stageProgresses.ppt = data.stage_progress;
                 else if (data.stage?.includes("语音") || data.stage?.includes("转写")) stageProgresses.voice = data.stage_progress;
                 else if (data.stage?.includes("LLM") || data.stage?.includes("评分")) stageProgresses.llm = data.stage_progress;
+                else if (data.stage?.includes("报告")) stageProgresses.report = data.stage_progress;
               }
               const completedStages = [...(task.completed_stages || [])];
               if (data.completed_stage && !completedStages.includes(data.completed_stage)) completedStages.push(data.completed_stage);
@@ -1018,8 +1051,8 @@ export default function App() {
           stage: "正在重试失败页",
           message: [
             `正在重试 ${retryIds.size} 个失败页`,
-            data.asr_concurrency ? `ASR 并发 ${data.asr_concurrency}` : "",
-            data.llm_concurrency ? `LLM 并发 ${data.llm_concurrency}` : "",
+            data.asr_concurrency ? `ASR 并发上限 ${data.asr_concurrency}` : "",
+            data.llm_concurrency ? `LLM 并发上限 ${data.llm_concurrency}` : "",
           ].filter(Boolean).join(" · "),
           pages: task.pages.map((page) => retryIds.has(page.page_id) ? {
             ...page,
@@ -1040,13 +1073,25 @@ export default function App() {
         setReportTask((current) => current?.id === result.id ? result : current);
         setCloudActive(0);
       } else if (data.type === "task.retry_failed") {
-        setError(data.error || "失败页重试未能完成。");
+        const message = data.error || "失败页重试未能完成。";
+        setError(message);
         setCloudActive(0);
         setTasks((current) => current.map((task) => task.id === data.task_id ? {
           ...task,
           status: "completed_with_errors",
           stage: "重试失败",
-          message: data.error || "失败页重试未能完成。",
+          message,
+          pages: task.pages.map((page) =>
+            ["retry_waiting", "transcribing", "scoring"].includes(page.status || "")
+              ? {
+                ...page,
+                status: "failed" as const,
+                failure_stage: page.failure_stage
+                  || (page.status === "scoring" ? "llm" as const : "asr" as const),
+                reason: page.reason || message,
+              }
+              : page,
+          ),
         } : task));
       } else if (data.type === "task.deleted") {
         setTasks((current) => current.filter((task) => task.id !== data.task_id));
@@ -1088,6 +1133,20 @@ export default function App() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [activeTaskId, activeTask?.status]);
+
+  const hasRunningTask = tasks.some((task) => task.status === "running");
+  useEffect(() => {
+    if (!hasRunningTask || workerStatus !== "ready" || !settings.output_root) return;
+    // Completion is persisted before the final event. Polling provides a safe
+    // recovery path if the desktop misses that one event or resumes mid-task.
+    const timer = window.setInterval(() => {
+      void sendWorker({
+        action: "list_tasks",
+        output_root: settings.output_root,
+      }).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTask, settings.output_root, workerStatus]);
 
   useEffect(() => {
     if (!activeTask) return;

@@ -439,17 +439,49 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         evaluation
         and (failed_pages > 0 or evaluation_complete is False)
     ) or asr_failed_pages > 0 or recovered_failed_pages > 0 or metadata_status == "completed_with_errors"
-    if actively_running:
+    # Finalization calls load_task() before the worker thread exits.  A persisted
+    # terminal status must therefore win over the still-alive thread; otherwise
+    # task.completed carries status="running" and the desktop stays stuck forever.
+    if metadata_status == "completed_with_errors":
+        task_status = "completed_with_errors"
+    elif metadata_status == "completed":
+        task_status = "completed"
+    elif actively_running:
         task_status = "running"
     elif completed_with_errors:
         task_status = "completed_with_errors"
-    elif metadata_status == "completed" or evaluation:
+    elif evaluation:
         task_status = "completed"
     elif metadata_status in {"failed", "cancelled"}:
         task_status = "failed"
     else:
         task_status = "idle"
     finished = task_status in {"completed", "completed_with_errors"}
+    total_pages = max(len(page_map), 1)
+    transcript_page_count = len({
+        int(page["page_id"])
+        for page in (transcript or {}).get("pages", [])
+        if isinstance(page, Mapping) and "page_id" in page
+    })
+    evaluation_page_count = len({
+        int(page["page_id"])
+        for page in (evaluation or {}).get("pages", [])
+        if isinstance(page, Mapping) and "page_id" in page
+    })
+    stage_progresses = {
+        "ppt": 100,
+        "voice": (
+            0
+            if mode == "detect"
+            else min(100, round(transcript_page_count / total_pages * 100))
+        ),
+        "llm": (
+            0
+            if not include_llm
+            else min(100, round(evaluation_page_count / total_pages * 100))
+        ),
+        "report": 100 if finished else 0,
+    }
     completed_stages = ["ppt"]
     if transcript:
         completed_stages.append("voice")
@@ -495,6 +527,7 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         "include_llm": include_llm,
         "mode": mode,
         "completed_stages": completed_stages,
+        "stage_progresses": stage_progresses,
         "summary": (
             evaluation.get("summary", {})
             if evaluation
@@ -626,6 +659,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
     started_at = time.perf_counter()
     task_id = str(payload.get("task_id") or "")
     run_dir: Path | None = None
+    llm_executor: ThreadPoolExecutor | None = None
     previous_metadata_status = "completed_with_errors"
     try:
         run_dir = resolve_existing_task_dir(
@@ -812,6 +846,12 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         active_llm = 0
         peak_asr = 0
         peak_llm = 0
+        retry_cloud_limit = min(
+            10,
+            (retry_asr_config.mimo_max_concurrency if retry_asr_config else 0)
+            + (retry_llm_settings.max_concurrency if retry_llm_settings else 0),
+        )
+        retry_cloud_slots = threading.BoundedSemaphore(max(1, retry_cloud_limit))
 
         def emit_retry_activity() -> None:
             emit(
@@ -820,12 +860,111 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 active_cloud_requests=active_asr + active_llm,
                 asr_active_requests=active_asr,
                 llm_active_requests=active_llm,
-                cloud_limit=min(
-                    10,
-                    (retry_asr_config.mimo_max_concurrency if retry_asr_config else 0)
-                    + (retry_llm_settings.max_concurrency if retry_llm_settings else 0),
-                ),
+                cloud_limit=retry_cloud_limit,
             )
+
+        evaluation_pages: dict[int, dict[str, Any]] = {}
+        llm_futures: dict[Any, int] = {}
+        llm_submitted_ids: set[int] = set()
+        llm_settings = retry_llm_settings
+        llm_key = ""
+
+        if llm_settings is not None:
+            if not bool(payload.get("llm_upload_consent")):
+                raise ValueError("请确认允许重新发送失败页截图和课堂转写。")
+            llm_key = str(payload.get("llm_api_key") or "").strip()
+            llm_key = llm_key or os.environ.get("LLM_API_KEY", "").strip()
+            if not llm_key:
+                raise ValueError("没有找到 LLM API Key。")
+            evaluation_pages = {
+                int(item["page_id"]): dict(item)
+                for item in evaluation.get("pages", [])
+                if isinstance(item, Mapping) and "page_id" in item
+            }
+
+            def retry_llm(page_id: int) -> tuple[int, dict[str, Any]]:
+                nonlocal active_llm, peak_llm
+                require_not_cancelled()
+                active_page = dict(transcript_pages[page_id])
+                active_page.pop("failure_stage", None)
+                active_page.pop("reason", None)
+                with retry_cloud_slots:
+                    emit_page(active_page, "scoring", task_id=task_id)
+                    with activity_lock:
+                        active_llm += 1
+                        peak_llm = max(peak_llm, active_llm)
+                        emit_retry_activity()
+                    try:
+                        try:
+                            result = evaluate_page(
+                                transcript_pages[page_id],
+                                transcript_path=transcript_path,
+                                config=llm_settings,
+                                output_dir=run_dir / "llm_evaluation",
+                                api_key=llm_key,
+                            )
+                        except Exception as exc:
+                            result = {
+                                "page_id": page_id,
+                                "start_sec": transcript_pages[page_id].get(
+                                    "start_sec", 0
+                                ),
+                                "end_sec": transcript_pages[page_id].get(
+                                    "end_sec", 0
+                                ),
+                                "status": "failed",
+                                "failure_stage": "llm",
+                                "speech_relevance": 0,
+                                "ppt_coverage": 0,
+                                "evidence_consistency": 0,
+                                "score": 0,
+                                "level": "请求失败",
+                                "reason": str(exc),
+                            }
+                        if result.get("status") == "failed":
+                            result["failure_stage"] = "llm"
+                        kwargs = {
+                            "score": result.get("score"),
+                            "level": result.get("level"),
+                            "reason": result.get("reason"),
+                            "failure_stage": result.get("failure_stage"),
+                        }
+                        if "matched_evidence" in result:
+                            kwargs["evidence"] = result.get("matched_evidence")
+                        emit_page(
+                            transcript_pages[page_id],
+                            (
+                                "failed"
+                                if result.get("status") == "failed"
+                                else "completed"
+                            ),
+                            task_id=task_id,
+                            **kwargs,
+                        )
+                        return page_id, result
+                    finally:
+                        with activity_lock:
+                            active_llm = max(0, active_llm - 1)
+                            emit_retry_activity()
+
+            total_llm_targets = len(
+                set(llm_target_ids)
+                | (set(asr_target_ids) if evaluation else set())
+            )
+            llm_executor = ThreadPoolExecutor(
+                max_workers=min(llm_settings.max_concurrency, total_llm_targets),
+                thread_name_prefix="retry-page-llm",
+            )
+
+            def submit_llm_retry(page_id: int) -> None:
+                if page_id in llm_submitted_ids:
+                    return
+                llm_submitted_ids.add(page_id)
+                assert llm_executor is not None
+                llm_futures[llm_executor.submit(retry_llm, page_id)] = page_id
+
+            for page_id in llm_target_ids:
+                submit_llm_retry(page_id)
 
         if asr_target_ids:
             if not bool(payload.get("asr_upload_consent")):
@@ -876,23 +1015,24 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 active_page = dict(transcript_pages[page_id])
                 active_page.pop("failure_stage", None)
                 active_page.pop("reason", None)
-                emit_page(active_page, "transcribing", task_id=task_id)
-                with activity_lock:
-                    active_asr += 1
-                    peak_asr = max(peak_asr, active_asr)
-                    emit_retry_activity()
-                try:
-                    pages, _ = transcribe_pages_with_mimo(
-                        video_path,
-                        [transcript_pages[page_id]],
-                        settings=asr_settings,
-                        api_key=asr_key,
-                    )
-                    return page_id, pages[0]
-                finally:
+                with retry_cloud_slots:
+                    emit_page(active_page, "transcribing", task_id=task_id)
                     with activity_lock:
-                        active_asr = max(0, active_asr - 1)
+                        active_asr += 1
+                        peak_asr = max(peak_asr, active_asr)
                         emit_retry_activity()
+                    try:
+                        pages, _ = transcribe_pages_with_mimo(
+                            video_path,
+                            [transcript_pages[page_id]],
+                            settings=asr_settings,
+                            api_key=asr_key,
+                        )
+                        return page_id, pages[0]
+                    finally:
+                        with activity_lock:
+                            active_asr = max(0, active_asr - 1)
+                            emit_retry_activity()
 
             with ThreadPoolExecutor(
                 max_workers=min(asr_config.mimo_max_concurrency, len(asr_target_ids)),
@@ -911,12 +1051,9 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                         result["transcription_status"] = "completed"
                         transcript_pages[page_id] = result
                         if evaluation:
-                            llm_target_ids.append(page_id)
-                        emit_page(
-                            result,
-                            "scoring" if evaluation else "completed",
-                            task_id=task_id,
-                        )
+                            submit_llm_retry(page_id)
+                        else:
+                            emit_page(result, "completed", task_id=task_id)
                     except Exception as exc:
                         failed = transcript_pages[page_id]
                         failed.update(
@@ -971,89 +1108,37 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 encoding="utf-8",
             )
 
-        if llm_target_ids:
-            if not bool(payload.get("llm_upload_consent")):
-                raise ValueError("请确认允许重新发送失败页截图和课堂转写。")
-            assert retry_llm_settings is not None
-            llm_settings = retry_llm_settings
-            llm_key = str(payload.get("llm_api_key") or "").strip()
-            llm_key = llm_key or os.environ.get("LLM_API_KEY", "").strip()
-            if not llm_key:
-                raise ValueError("没有找到 LLM API Key。")
-            evaluation_pages = {
-                int(item["page_id"]): dict(item)
-                for item in evaluation.get("pages", [])
-                if isinstance(item, Mapping) and "page_id" in item
-            }
-            def retry_llm(page_id: int) -> tuple[int, dict[str, Any]]:
-                nonlocal active_llm, peak_llm
-                require_not_cancelled()
-                active_page = dict(transcript_pages[page_id])
-                active_page.pop("failure_stage", None)
-                active_page.pop("reason", None)
-                emit_page(active_page, "scoring", task_id=task_id)
-                with activity_lock:
-                    active_llm += 1
-                    peak_llm = max(peak_llm, active_llm)
-                    emit_retry_activity()
+        if llm_executor is not None:
+            for future in as_completed(list(llm_futures)):
+                page_id = llm_futures[future]
                 try:
-                    result = evaluate_page(
-                        transcript_pages[page_id],
-                        transcript_path=transcript_path,
-                        config=llm_settings,
-                        output_dir=run_dir / "llm_evaluation",
-                        api_key=llm_key,
-                    )
-                    if result.get("status") == "failed":
-                        result["failure_stage"] = "llm"
-                    return page_id, result
-                finally:
-                    with activity_lock:
-                        active_llm = max(0, active_llm - 1)
-                        emit_retry_activity()
-
-            unique_llm_ids = sorted(set(llm_target_ids))
-            with ThreadPoolExecutor(
-                max_workers=min(llm_settings.max_concurrency, len(unique_llm_ids)),
-                thread_name_prefix="retry-page-llm",
-            ) as executor:
-                futures = {
-                    executor.submit(retry_llm, page_id): page_id
-                    for page_id in unique_llm_ids
-                }
-                for future in as_completed(futures):
-                    page_id = futures[future]
-                    try:
-                        _, result = future.result()
-                    except Exception as exc:
-                        result = {
-                            "page_id": page_id,
-                            "start_sec": transcript_pages[page_id].get("start_sec", 0),
-                            "end_sec": transcript_pages[page_id].get("end_sec", 0),
-                            "status": "failed",
-                            "failure_stage": "llm",
-                            "speech_relevance": 0,
-                            "ppt_coverage": 0,
-                            "evidence_consistency": 0,
-                            "score": 0,
-                            "level": "请求失败",
-                            "reason": str(exc),
-                        }
-                    evaluation_pages[page_id] = result
-                    kwargs = {
-                        "score": result.get("score"),
-                        "level": result.get("level"),
-                        "reason": result.get("reason"),
-                        "failure_stage": result.get("failure_stage"),
+                    _, result = future.result()
+                except Exception as exc:
+                    result = {
+                        "page_id": page_id,
+                        "start_sec": transcript_pages[page_id].get("start_sec", 0),
+                        "end_sec": transcript_pages[page_id].get("end_sec", 0),
+                        "status": "failed",
+                        "failure_stage": "llm",
+                        "speech_relevance": 0,
+                        "ppt_coverage": 0,
+                        "evidence_consistency": 0,
+                        "score": 0,
+                        "level": "请求失败",
+                        "reason": str(exc),
                     }
-                    if "matched_evidence" in result:
-                        kwargs["evidence"] = result.get("matched_evidence")
                     emit_page(
                         transcript_pages[page_id],
-                        "failed" if result.get("status") == "failed" else "completed",
+                        "failed",
                         task_id=task_id,
-                        **kwargs,
+                        failure_stage="llm",
+                        reason=str(exc),
                     )
+                evaluation_pages[page_id] = result
+            llm_executor.shutdown(wait=True)
+            llm_executor = None
+        if llm_futures:
+            assert llm_settings is not None
             ordered_evaluations = [
                 evaluation_pages[key] for key in sorted(evaluation_pages)
             ]
@@ -1114,6 +1199,8 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
             traceback=traceback.format_exc(),
         )
     finally:
+        if llm_executor is not None:
+            llm_executor.shutdown(wait=False, cancel_futures=True)
         with _task_lock:
             if run_dir is not None and _active_task_dir == run_dir.resolve():
                 _active_task_dir = None
@@ -1272,7 +1359,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             video_path=str(video.resolve()),
             run_dir=str(run_dir.resolve()),
             started_at=time.time(),
-            algorithm_version="1.4.9",
+            algorithm_version="1.4.11",
             streaming_page_confirmation=(selected_detector_algorithm == "temporal"),
             detector_algorithm=selected_detector_algorithm,
             mode=mode,
@@ -1599,6 +1686,15 @@ def run_task(payload: Mapping[str, Any]) -> None:
             )
         except OSError:
             pass
+        emit(
+            "task.progress",
+            task_id=task_id,
+            stage="生成报告",
+            message="分析报告已生成，正在保存任务状态",
+            progress=99,
+            stage_progress=100,
+            completed_stage="report",
+        )
         task = load_task(run_dir)
         emit(
             "task.completed",
@@ -1707,7 +1803,7 @@ def handle_command(command: Mapping[str, Any]) -> None:
         emit(
             "worker.ready",
             project_root=str(project_root()),
-            algorithm_version="1.4.9",
+            algorithm_version="1.4.11",
             ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
             ffprobe_path=bundled_tool("ffprobe") or "PATH",
         )
@@ -1753,7 +1849,7 @@ def main() -> int:
     emit(
         "worker.ready",
         project_root=str(project_root()),
-        algorithm_version="1.4.9",
+        algorithm_version="1.4.11",
         ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
         ffprobe_path=bundled_tool("ffprobe") or "PATH",
     )

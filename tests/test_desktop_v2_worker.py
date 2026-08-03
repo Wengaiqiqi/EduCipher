@@ -38,7 +38,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
         with patch("video_page_detector.desktop_v2_worker.emit") as emit:
             handle_command({"action": "ping"})
         self.assertEqual(emit.call_args.args, ("worker.ready",))
-        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.9")
+        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.11")
 
     def test_detailed_evidence_setting_reaches_llm_config(self) -> None:
         self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
@@ -327,6 +327,169 @@ class DesktopV2WorkerTests(unittest.TestCase):
             self.assertEqual(peak, 3)
             self.assertEqual(max(activity_values), 3)
 
+    def test_mixed_asr_and_llm_retries_start_in_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "mixed-retry"
+            run_dir.mkdir()
+            evaluation_dir = run_dir / "llm_evaluation"
+            evaluation_dir.mkdir()
+            video_path = Path(temp) / "mixed-retry.mp4"
+            video_path.write_bytes(b"video")
+            pages = [
+                {
+                    "page_id": 1,
+                    "start_sec": 0,
+                    "end_sec": 5,
+                    "screenshot_path": str(run_dir / "page_001.jpg"),
+                    "speech_text": "",
+                    "utterances": [],
+                    "failure_stage": "asr",
+                    "transcription_status": "failed",
+                },
+                {
+                    "page_id": 2,
+                    "start_sec": 5,
+                    "end_sec": 10,
+                    "screenshot_path": str(run_dir / "page_002.jpg"),
+                    "speech_text": "第二页讲话",
+                    "utterances": [
+                        {"start_sec": 5, "end_sec": 10, "text": "第二页讲话"}
+                    ],
+                },
+            ]
+            (run_dir / "result.json").write_text(
+                json.dumps({"video_id": "mixed-retry", "pages": pages}),
+                encoding="utf-8",
+            )
+            (run_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "mixed-retry",
+                        "video_path": str(video_path),
+                        "pages": pages,
+                        "transcription": {
+                            "cloud_statistics": {"failed_page_count": 1}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (evaluation_dir / "llm_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "mixed-retry",
+                        "pages": [
+                            {
+                                "page_id": 2,
+                                "status": "failed",
+                                "failure_stage": "llm",
+                                "score": 0,
+                                "reason": "timeout",
+                            }
+                        ],
+                        "summary": {"failed_pages": 1, "complete": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed_with_errors",
+                        "mode": "full",
+                        "include_llm": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            asr_started = threading.Event()
+            llm_started = threading.Event()
+            release = threading.Event()
+
+            def transcribe(_video, retry_pages, **_kwargs):
+                asr_started.set()
+                release.wait(timeout=3)
+                page = dict(retry_pages[0])
+                page.update(
+                    {
+                        "speech_text": "第一页恢复成功",
+                        "utterances": [
+                            {
+                                "start_sec": 0,
+                                "end_sec": 5,
+                                "text": "第一页恢复成功",
+                            }
+                        ],
+                    }
+                )
+                return [page], {}
+
+            def score(page, **_kwargs):
+                if int(page["page_id"]) == 2:
+                    llm_started.set()
+                release.wait(timeout=3)
+                return {
+                    "page_id": page["page_id"],
+                    "start_sec": page["start_sec"],
+                    "end_sec": page["end_sec"],
+                    "status": "scored",
+                    "score": 90,
+                    "reason": "相关",
+                }
+
+            with (
+                patch(
+                    "video_page_detector.desktop_v2_worker.transcribe_pages_with_mimo",
+                    side_effect=transcribe,
+                ),
+                patch(
+                    "video_page_detector.desktop_v2_worker.evaluate_page",
+                    side_effect=score,
+                ),
+                patch("video_page_detector.desktop_v2_worker.emit") as emit,
+            ):
+                retry_thread = threading.Thread(
+                    target=run_retry_failed_pages,
+                    args=(
+                        {
+                            "task_id": str(run_dir),
+                            "output_root": temp,
+                            "page_ids": [1, 2],
+                            "settings": {
+                                "asr_engine": "mimo-cloud",
+                                "asr_concurrency": 5,
+                                "llm_concurrency": 5,
+                                "include_evidence": False,
+                            },
+                            "asr_api_key": "test-key",
+                            "llm_api_key": "test-key",
+                            "asr_upload_consent": True,
+                            "llm_upload_consent": True,
+                        },
+                    ),
+                )
+                retry_thread.start()
+                try:
+                    self.assertTrue(asr_started.wait(timeout=1))
+                    self.assertTrue(llm_started.wait(timeout=1))
+                finally:
+                    release.set()
+                    retry_thread.join(timeout=3)
+
+            self.assertFalse(retry_thread.is_alive())
+            retry_failures = [
+                (call.kwargs.get("error"), call.kwargs.get("traceback"))
+                for call in emit.call_args_list
+                if call.args == ("task.retry_failed",)
+            ]
+            self.assertTrue(
+                any(
+                    call.args == ("task.retry_completed",)
+                    for call in emit.call_args_list
+                ),
+                retry_failures,
+            )
+
     def test_combines_utterance_text(self) -> None:
         text = page_speech_text(
             {
@@ -483,6 +646,71 @@ class DesktopV2WorkerTests(unittest.TestCase):
             assert task is not None
             self.assertEqual(task["status"], "running")
             self.assertEqual(task["stage"], "正在处理")
+            self.assertEqual(task["stage_progresses"]["ppt"], 100)
+
+    def test_persisted_completion_wins_while_worker_thread_is_finalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "lesson"
+            evaluation_dir = run_dir / "llm_evaluation"
+            evaluation_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": "lesson",
+                        "pages": [{"page_id": 1, "start_sec": 0, "end_sec": 5}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "transcript.json").write_text(
+                json.dumps({"pages": [{"page_id": 1, "speech_text": "讲解"}]}),
+                encoding="utf-8",
+            )
+            (evaluation_dir / "llm_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"complete": True, "failed_pages": 0},
+                        "pages": [{"page_id": 1, "status": "scored", "score": 90}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "mode": "full",
+                        "include_llm": True,
+                        "elapsed_sec": 12.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            active_thread = threading.Thread(target=lambda: time.sleep(0.2))
+            active_thread.start()
+            try:
+                with (
+                    patch(
+                        "video_page_detector.desktop_v2_worker._active_thread",
+                        active_thread,
+                    ),
+                    patch(
+                        "video_page_detector.desktop_v2_worker._active_task_dir",
+                        run_dir.resolve(),
+                    ),
+                ):
+                    task = load_task(run_dir)
+            finally:
+                active_thread.join()
+
+            assert task is not None
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["progress"], 100)
+            self.assertEqual(
+                task["stage_progresses"],
+                {"ppt": 100, "voice": 100, "llm": 100, "report": 100},
+            )
+            self.assertIn("report", task["completed_stages"])
 
     def test_failed_page_evaluation_reloads_as_completed_with_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
