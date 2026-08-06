@@ -32,6 +32,8 @@ PageASRRunner = Callable[
 ]
 PageLLMRunner = Callable[[Mapping[str, Any]], dict[str, Any]]
 MAX_COMBINED_CLOUD_REQUESTS = 10
+_GLOBAL_CLOUD_CONDITION = threading.Condition()
+_GLOBAL_CLOUD_ACTIVE = {"asr": 0, "llm": 0}
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -93,9 +95,6 @@ class CloudPagePipeline:
             transcription_config.mimo_max_concurrency
             + (llm_config.max_concurrency if llm_config is not None else 0),
         )
-        self._cloud_slots = threading.BoundedSemaphore(
-            self._cloud_concurrency_limit
-        )
         self._asr_executor = ThreadPoolExecutor(
             max_workers=transcription_config.mimo_max_concurrency,
             thread_name_prefix="page-pipeline-asr",
@@ -115,6 +114,7 @@ class CloudPagePipeline:
         self._asr_statistics: dict[int, dict[str, Any]] = {}
         self._evaluations: dict[int, dict[str, Any]] = {}
         self._asr_errors: dict[int, BaseException] = {}
+        self._deleted_page_ids: set[int] = set()
         self._total_pages = 0
         self._asr_completed = 0
         self._llm_completed = 0
@@ -126,6 +126,19 @@ class CloudPagePipeline:
         self._last_llm_completed_at: float | None = None
         self._closed = False
         self._aborted = False
+
+    def delete_page(self, page_id: int) -> None:
+        """Exclude a page from queued work and every persisted cloud result."""
+        with self._lock:
+            self._deleted_page_ids.add(int(page_id))
+            self._page_transcripts.pop(int(page_id), None)
+            self._asr_statistics.pop(int(page_id), None)
+            self._evaluations.pop(int(page_id), None)
+            self._asr_errors.pop(int(page_id), None)
+
+    def _is_deleted(self, page_id: int) -> bool:
+        with self._lock:
+            return int(page_id) in self._deleted_page_ids
 
     def _raise_if_cancelled(self) -> None:
         if self._cancel_event is not None and self._cancel_event.is_set():
@@ -177,8 +190,24 @@ class CloudPagePipeline:
             self.page_activity_callback(page, status)
 
     @contextmanager
-    def _cloud_request(self):
-        self._cloud_slots.acquire()
+    def _cloud_request(self, stage: str):
+        stage_limit = (
+            self.transcription_config.mimo_max_concurrency
+            if stage == "asr"
+            else self.llm_config.max_concurrency if self.llm_config else 0
+        )
+        with _GLOBAL_CLOUD_CONDITION:
+            while (
+                sum(_GLOBAL_CLOUD_ACTIVE.values())
+                >= MAX_COMBINED_CLOUD_REQUESTS
+                or _GLOBAL_CLOUD_ACTIVE[stage] >= stage_limit
+            ):
+                if self._aborted:
+                    raise RuntimeError("页面流水线已经终止。")
+                self._raise_if_cancelled()
+                _GLOBAL_CLOUD_CONDITION.wait(timeout=0.1)
+            _GLOBAL_CLOUD_ACTIVE[stage] += 1
+            global_active = sum(_GLOBAL_CLOUD_ACTIVE.values())
         try:
             with self._lock:
                 self._active_cloud_requests += 1
@@ -186,8 +215,7 @@ class CloudPagePipeline:
                     self._peak_cloud_requests,
                     self._active_cloud_requests,
                 )
-                active = self._active_cloud_requests
-            self._report_cloud_activity(active)
+            self._report_cloud_activity(global_active)
             yield
         finally:
             with self._lock:
@@ -195,9 +223,13 @@ class CloudPagePipeline:
                     0,
                     self._active_cloud_requests - 1,
                 )
-                active = self._active_cloud_requests
-            self._cloud_slots.release()
-            self._report_cloud_activity(active)
+            with _GLOBAL_CLOUD_CONDITION:
+                _GLOBAL_CLOUD_ACTIVE[stage] = max(
+                    0, _GLOBAL_CLOUD_ACTIVE[stage] - 1
+                )
+                global_active = sum(_GLOBAL_CLOUD_ACTIVE.values())
+                _GLOBAL_CLOUD_CONDITION.notify_all()
+            self._report_cloud_activity(global_active)
 
     def submit_page(
         self,
@@ -236,8 +268,10 @@ class CloudPagePipeline:
         self,
         page: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if self._is_deleted(int(page["page_id"])):
+            return dict(page), {}
         self._raise_if_cancelled()
-        with self._cloud_request():
+        with self._cloud_request("asr"):
             self._raise_if_cancelled()
             self._report_page_activity(page, "transcribing")
             if self._asr_runner is not None:
@@ -273,6 +307,9 @@ class CloudPagePipeline:
             page_transcript, statistics = future.result()
         except BaseException as exc:
             with self._lock:
+                if page_id in self._deleted_page_ids:
+                    self._asr_completed += 1
+                    return
                 self._asr_errors[page_id] = exc
                 self._asr_completed += 1
                 completed = self._asr_completed
@@ -287,6 +324,9 @@ class CloudPagePipeline:
 
         with self._lock:
             if self._aborted:
+                return
+            if page_id in self._deleted_page_ids:
+                self._asr_completed += 1
                 return
             self._page_transcripts[page_id] = dict(page_transcript)
             self._asr_statistics[page_id] = dict(statistics)
@@ -304,7 +344,7 @@ class CloudPagePipeline:
         if self._llm_executor is None:
             return
         with self._lock:
-            if self._aborted:
+            if self._aborted or page_id in self._deleted_page_ids:
                 return
             if self._first_llm_submitted_at is None:
                 self._first_llm_submitted_at = time.perf_counter()
@@ -324,8 +364,10 @@ class CloudPagePipeline:
         self,
         page: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if self._is_deleted(int(page["page_id"])):
+            return {"page_id": int(page["page_id"]), "status": "deleted"}
         self._raise_if_cancelled()
-        with self._cloud_request():
+        with self._cloud_request("llm"):
             self._raise_if_cancelled()
             self._report_page_activity(page, "scoring")
             if self._llm_runner is not None:
@@ -347,6 +389,9 @@ class CloudPagePipeline:
         with self._lock:
             if self._aborted:
                 return
+            if page_id in self._deleted_page_ids:
+                self._llm_completed += 1
+                return
         try:
             evaluation = dict(future.result())
         except BaseException as exc:
@@ -367,6 +412,9 @@ class CloudPagePipeline:
             evaluation["failure_stage"] = "llm"
         with self._lock:
             if self._aborted:
+                return
+            if page_id in self._deleted_page_ids:
+                self._llm_completed += 1
                 return
             self._evaluations[page_id] = evaluation
             self._llm_completed += 1
@@ -403,14 +451,19 @@ class CloudPagePipeline:
         if self._llm_executor is not None:
             self._llm_executor.shutdown(wait=True)
 
+        with self._lock:
+            deleted_ids = set(self._deleted_page_ids)
         pages = [
             dict(page)
             for page in detection.get("pages", [])
             if isinstance(page, Mapping)
+            and int(page["page_id"]) not in deleted_ids
         ]
         expected_ids = {int(page["page_id"]) for page in pages}
         if self._asr_errors:
             for page_id, error in self._asr_errors.items():
+                if page_id in deleted_ids:
+                    continue
                 source = dict(
                     self._submitted_pages.get(page_id, {"page_id": page_id})
                 )
@@ -459,6 +512,8 @@ class CloudPagePipeline:
                 return
             self._closed = True
             self._aborted = True
+        with _GLOBAL_CLOUD_CONDITION:
+            _GLOBAL_CLOUD_CONDITION.notify_all()
         self._asr_executor.shutdown(wait=False, cancel_futures=True)
         if self._llm_executor is not None:
             self._llm_executor.shutdown(wait=False, cancel_futures=True)

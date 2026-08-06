@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
   BarChart3,
@@ -271,7 +271,7 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
               <span>{failed ? <X size={15} /> : done ? <Check size={15} /> : active ? <LoaderCircle size={15} /> : waiting ? <LoaderCircle size={15} /> : <span className="stage-dot" />}</span>
               <div>
                 <strong>{label}</strong>
-                <small>{disabled ? "未启用" : `${pct}%${failed ? " · 有错误" : done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}`}</small>
+                <small>{disabled ? "未启用" : failed ? "有错误" : `${pct}%${done ? " · 已完成" : active ? " · 进行中" : waiting ? " · 等待中" : ""}`}</small>
               </div>
             </div>
             {label !== "生成报告" && <div className={`stage-link ${done && !failed ? "done" : ""}`} />}
@@ -284,15 +284,19 @@ function StagePipeline({ task }: { task?: TaskRecord }) {
 
 function PageCard({
   page,
+  pageNumber,
   selected,
   onClick,
   onRetryPage,
+  onOpenMenu,
   retryQueued = false,
 }: {
   page: PageRecord;
+  pageNumber: number;
   selected: boolean;
   onClick: () => void;
   onRetryPage?: (page: PageRecord) => void;
+  onOpenMenu?: (page: PageRecord, x: number, y: number) => void;
   retryQueued?: boolean;
 }) {
   return (
@@ -304,13 +308,18 @@ function PageCard({
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") onClick();
       }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onOpenMenu?.(page, event.clientX, event.clientY);
+      }}
+      title="右键打开页面操作菜单"
     >
       <div className="page-thumb">
         <SlideImage page={page} compact />
       </div>
       <div className="page-card-body">
         <div className="page-card-title">
-          <strong>第 {page.page_id} 页</strong>
+          <strong>第 {pageNumber} 页</strong>
           <span>
             {formatTime(page.start_sec)} — {formatTime(page.end_sec)}
           </span>
@@ -398,7 +407,7 @@ function ReportViewer({
         {page && (
           <div className="report-viewer-page-view">
             <div className="report-viewer-page-head">
-              <strong>第 {page.page_id} 页</strong>
+              <strong>第 {pageIndex + 1} 页</strong>
               <span>{formatTime(page.start_sec)} — {formatTime(page.end_sec)}</span>
               {page.status !== "failed" && page.score != null && <b>{Math.round(page.score)}分</b>}
               {page.status === "failed" && onRetryPage && (
@@ -465,11 +474,13 @@ function ReportViewer({
 }
 function Inspector({
   page,
+  pageNumber,
   task,
   settings,
   onRetryPage,
 }: {
   page?: PageRecord;
+  pageNumber?: number;
   task?: TaskRecord;
   settings?: AppSettings;
   onRetryPage?: (page: PageRecord) => void;
@@ -478,7 +489,7 @@ function Inspector({
   return (
     <aside className="inspector">
       <div className="inspector-header">
-        <h2>{page ? `第 ${page.page_id} 页详情` : "页面详情"}</h2>
+        <h2>{page ? `第 ${pageNumber ?? page.page_id} 页详情` : "页面详情"}</h2>
       </div>
       <div className="inspector-scroll">
         <div className="large-preview">
@@ -696,9 +707,9 @@ function NewTaskModal({
 }: {
   settings: AppSettings;
   onClose: () => void;
-  onStart: (payload: StartTaskPayload) => Promise<void>;
+  onStart: (payloads: StartTaskPayload[]) => Promise<void>;
 }) {
-  const [videoPath, setVideoPath] = useState("");
+  const [videoPaths, setVideoPaths] = useState<string[]>([]);
   const [outputRoot, setOutputRoot] = useState(settings.output_root);
   const [videoId, setVideoId] = useState("");
   const [mode, setMode] = useState<"full" | "detect">("full");
@@ -706,12 +717,13 @@ function NewTaskModal({
 
   async function chooseVideo() {
     const value = await open({
-      multiple: false,
+      multiple: true,
       filters: [{ name: "视频文件", extensions: ["mp4", "mkv", "mov", "avi", "wmv", "m4v", "webm"] }],
     });
-    if (typeof value === "string") {
-      setVideoPath(value);
-      const file = value.split(/[\\/]/).pop() || "";
+    const paths = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+    if (paths.length) {
+      setVideoPaths(paths);
+      const file = paths[0].split(/[\\/]/).pop() || "";
       setVideoId(file.replace(/\.[^.]+$/, ""));
     }
   }
@@ -722,25 +734,28 @@ function NewTaskModal({
   }
 
   async function submit() {
-    if (!videoPath || !outputRoot || !videoId.trim()) {
+    if (!videoPaths.length || !outputRoot || (videoPaths.length === 1 && !videoId.trim())) {
       setError("请选择视频、结果目录并填写任务名称。");
       return;
     }
-    await onStart({
-      video_path: videoPath,
-      output_root: outputRoot,
-      video_id: videoId.trim(),
-      mode,
-      settings: {
-        ...settings,
-        asr_api_key: "",
-        llm_api_key: "",
-      },
-      asr_api_key: settings.asr_api_key,
-      llm_api_key: settings.llm_api_key,
-      asr_upload_consent: true,
-      llm_upload_consent: true,
-    });
+    const names = new Map<string, number>();
+    await onStart(videoPaths.map((videoPath) => {
+      const file = videoPath.split(/[\\/]/).pop() || "视频";
+      const stem = file.replace(/\.[^.]+$/, "");
+      const count = (names.get(stem) || 0) + 1;
+      names.set(stem, count);
+      return {
+        video_path: videoPath,
+        output_root: outputRoot,
+        video_id: videoPaths.length === 1 ? videoId.trim() : `${stem}${count > 1 ? `_${count}` : ""}`,
+        mode,
+        settings: { ...settings, asr_api_key: "", llm_api_key: "" },
+        asr_api_key: settings.asr_api_key,
+        llm_api_key: settings.llm_api_key,
+        asr_upload_consent: true,
+        llm_upload_consent: true,
+      };
+    }));
   }
 
   return (
@@ -749,7 +764,7 @@ function NewTaskModal({
         <div className="modal-header">
           <div>
             <h2>新建课堂分析任务</h2>
-            <p>选择一个课堂视频，课析会自动完成页面、语音和关联度分析。</p>
+            <p>可一次选择多个课堂视频，课析会按照选择顺序进入处理流水线。</p>
           </div>
           <button className="icon-button" onClick={onClose}><X size={19} /></button>
         </div>
@@ -758,13 +773,18 @@ function NewTaskModal({
             课堂视频
             <button className="path-picker" onClick={chooseVideo}>
               <Video size={17} />
-              <span>{videoPath || "选择 MP4 或其他课堂视频"}</span>
+              <span>{videoPaths.length ? `已选择 ${videoPaths.length} 个视频` : "选择一个或多个课堂视频"}</span>
               <FolderOpen size={16} />
             </button>
           </label>
+          {videoPaths.length > 0 && (
+            <div className="selected-video-list">
+              {videoPaths.map((path, index) => <span key={path}>{index + 1}. {path.split(/[\\/]/).pop()}</span>)}
+            </div>
+          )}
           <div className="form-two-columns">
-            <label>任务名称<input value={videoId} onChange={(e) => setVideoId(e.target.value)} placeholder="例如：大学物理第3讲" /></label>
-            <label>
+            {videoPaths.length <= 1 && <label>任务名称<input value={videoId} onChange={(e) => setVideoId(e.target.value)} placeholder="例如：大学物理第3讲" /></label>}
+            <label className={videoPaths.length > 1 ? "wide-field" : ""}>
               处理范围
               <select value={mode} onChange={(e) => setMode(e.target.value as "full" | "detect")}>
                 <option value="full">完整流程：PPT + ASR + 评分</option>
@@ -784,7 +804,7 @@ function NewTaskModal({
         </div>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>取消</button>
-          <button className="button primary" onClick={submit}><Play size={16} />开始处理</button>
+          <button className="button primary" onClick={submit}><Play size={16} />加入处理队列</button>
         </div>
       </div>
     </div>
@@ -854,7 +874,14 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [deleteCandidate, setDeleteCandidate] = useState<TaskRecord | null>(null);
   const [reportTask, setReportTask] = useState<TaskRecord | null>(null);
+  const [pageContextMenu, setPageContextMenu] = useState<{
+    task: TaskRecord;
+    page: PageRecord;
+    x: number;
+    y: number;
+  } | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [cloudActive, setCloudActive] = useState(0);
   const [error, setError] = useState("");
@@ -867,6 +894,9 @@ export default function App() {
   const selectedPage =
     activeTask?.pages.find((page) => page.page_id === selectedPageId) ||
     activeTask?.pages[0];
+  const selectedPageNumber = selectedPage
+    ? (activeTask?.pages.findIndex((page) => page.page_id === selectedPage.page_id) ?? 0) + 1
+    : undefined;
   const completedPages = activeTask?.pages.filter((page) => page.status === "completed").length || 0;
   const failedPages = activeTask?.pages.filter((page) => page.status === "failed").length || 0;
 
@@ -932,9 +962,10 @@ export default function App() {
         const filtered = data.tasks.filter((t) => t.pages.length > 0 || t.status === "running");
         setTasks((current) => {
           const incoming = new Map(filtered.map((task) => [task.id, task]));
-          const running = current
-            .filter((task) => task.status === "running")
+          const live = current
+            .filter((task) => task.status === "running" || task.status === "queued")
             .map((task) => {
+              if (task.status === "queued") return task;
               const refreshed = incoming.get(task.id);
               if (!refreshed) return task;
               incoming.delete(task.id);
@@ -943,15 +974,38 @@ export default function App() {
               return refreshed.status === "running" ? task : refreshed;
             });
           return [
-            ...running,
+            ...live,
             ...incoming.values(),
           ];
         });
         setActiveTaskId((current) => current || filtered[0]?.id || "");
         return;
       }
-      if (data.type === "task.started") {
-        setCloudActive(0);
+      if (data.type === "task.queued") {
+        const task: TaskRecord = {
+          id: data.task_id || `queue-${Date.now()}`,
+          video_id: data.video_id || "等待处理的视频",
+          video_path: data.video_path,
+          run_dir: "",
+          status: "queued",
+          progress: 0,
+          stage: "排队等待处理",
+          message: "等待 PPT 识别器空闲后自动进入流水线",
+          mode: data.mode,
+          include_llm: data.include_llm,
+          queue_position: data.queue_position,
+          pages: [],
+        };
+        setTasks((current) => [
+          ...current.filter((item) => item.id !== task.id),
+          task,
+        ]);
+      } else if (data.type === "task.queue_updated") {
+        setTasks((current) => current.map((task) => task.id === data.task_id ? {
+          ...task,
+          queue_position: data.queue_position,
+        } : task));
+      } else if (data.type === "task.started") {
         const task: TaskRecord = {
           id: data.task_id || `task-${Date.now()}`,
           video_id: (data as WorkerEvent & { video_id?: string }).video_id || "新任务",
@@ -965,7 +1019,10 @@ export default function App() {
           include_evidence: data.include_evidence ?? false,
           pages: [],
         };
-        setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)]);
+        setTasks((current) => [
+          task,
+          ...current.filter((item) => item.id !== task.id && item.id !== data.queue_id),
+        ]);
         setActiveTaskId(task.id);
         setSelectedPageId(null);
         setError("");
@@ -1024,17 +1081,32 @@ export default function App() {
           }),
         );
         setSelectedPageId((current) => current ?? data.page!.page_id);
+      } else if (data.type === "page.deleted" && data.page_id) {
+        if (data.result) {
+          setTasks((current) => [
+            data.result!,
+            ...current.filter((task) => task.id !== data.result!.id),
+          ]);
+          setReportTask((current) => current?.id === data.result!.id ? data.result! : current);
+          setSelectedPageId(data.result.pages[0]?.page_id ?? null);
+        } else {
+          setTasks((current) => current.map((task) => task.id === data.task_id ? {
+            ...task,
+            pages: task.pages.filter((page) => page.page_id !== data.page_id),
+          } : task));
+          setSelectedPageId((current) => current === data.page_id ? null : current);
+        }
+      } else if (data.type === "page.delete_failed") {
+        setError(data.error || "删除页面失败。");
       } else if (data.type === "task.completed" && data.result) {
         const result = { ...data.result, elapsed_sec: data.elapsed_sec ?? data.result.elapsed_sec };
         setTasks((current) => [result, ...current.filter((task) => task.id !== result.id)]);
-        setActiveTaskId(result.id);
-        setCloudActive(0);
+        setActiveTaskId((current) => current || result.id);
       } else if (data.type === "task.failed") {
         const message = data.error || "任务处理失败。";
         setError(message);
-        setCloudActive(0);
         setTasks((current) => current.map((task) =>
-          task.id === (data.task_id || task.id) && task.status === "running"
+          task.id === (data.task_id || task.id) && (task.status === "running" || task.status === "queued")
             ? markTaskInterrupted(task, message)
             : task,
         ));
@@ -1071,11 +1143,9 @@ export default function App() {
         setTasks((current) => [result, ...current.filter((task) => task.id !== result.id)]);
         setActiveTaskId(result.id);
         setReportTask((current) => current?.id === result.id ? result : current);
-        setCloudActive(0);
       } else if (data.type === "task.retry_failed") {
         const message = data.error || "失败页重试未能完成。";
         setError(message);
-        setCloudActive(0);
         setTasks((current) => current.map((task) => task.id === data.task_id ? {
           ...task,
           status: "completed_with_errors",
@@ -1113,6 +1183,7 @@ export default function App() {
       setSettings(normalizeCloudConcurrency(merged));
       await sendWorker({ action: "ping" });
       await sendWorker({ action: "list_tasks", output_root: merged.output_root });
+      await sendWorker({ action: "replay_active" });
     }).catch((reason) => {
       setWorkerStatus("failed");
       setError(`无法初始化处理引擎：${String(reason)}`);
@@ -1156,12 +1227,14 @@ export default function App() {
     }
   }, [activeTaskId, activeTask?.pages.length]);
 
-  async function startTask(payload: StartTaskPayload) {
+  async function startTasks(payloads: StartTaskPayload[]) {
     setShowNewTask(false);
     setNav("tasks");
     setError("");
     try {
-      await sendWorker({ action: "start", payload });
+      for (const payload of payloads) {
+        await sendWorker({ action: "start", payload });
+      }
     } catch (reason) {
       setWorkerStatus("failed");
       setError(`无法启动任务：${String(reason)}`);
@@ -1182,16 +1255,18 @@ export default function App() {
     setShowSettings(false);
   }
 
-  async function deleteTask(task: TaskRecord) {
-    if (task.status === "running") {
-      setError("正在处理或重试的任务不能删除。");
+  function deleteTask(task: TaskRecord) {
+    if (task.status === "running" || task.status === "queued") {
+      setError("正在处理或排队的任务不能删除。");
       return;
     }
-    const confirmed = await confirmDialog(
-      `确定删除“${task.video_id}”吗？任务结果、转写和分析报告都会一并删除，且无法恢复。`,
-      { title: "删除任务", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
-    );
-    if (!confirmed) return;
+    setDeleteCandidate(task);
+  }
+
+  async function confirmDeleteTask() {
+    if (!deleteCandidate) return;
+    const task = deleteCandidate;
+    setDeleteCandidate(null);
     setError("");
     try {
       await sendWorker({
@@ -1201,6 +1276,20 @@ export default function App() {
       });
     } catch (reason) {
       setError(`无法删除任务：${String(reason)}`);
+    }
+  }
+
+  async function deletePage(task: TaskRecord, page: PageRecord) {
+    setError("");
+    try {
+      await sendWorker({
+        action: "delete_page",
+        task_id: task.id,
+        page_id: page.page_id,
+        output_root: settings.output_root,
+      });
+    } catch (reason) {
+      setError(`无法删除页面：${String(reason)}`);
     }
   }
 
@@ -1236,7 +1325,7 @@ export default function App() {
     }
   }
 
-  const recentTasks = useMemo(() => tasks.filter((t) => t.pages.length > 0 || t.status === "running").slice(0, 8), [tasks]);
+  const recentTasks = useMemo(() => tasks.filter((t) => t.pages.length > 0 || t.status === "running" || t.status === "queued").slice(0, 30), [tasks]);
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${theme}`}>
@@ -1304,6 +1393,8 @@ export default function App() {
                   <span>
                     {task.status === "running"
                       ? "正在处理"
+                      : task.status === "queued"
+                        ? `排队中 · 第 ${task.queue_position || 1} 个`
                       : task.status === "completed_with_errors"
                         ? `${task.pages.length} 页 · 存在错误`
                         : `${task.pages.length} 页`}
@@ -1312,9 +1403,9 @@ export default function App() {
                       : ""}
                   </span>
                 </div>
-                {task.status === "running" && <i className="task-dot" />}
+                {(task.status === "running" || task.status === "queued") && <i className="task-dot" />}
               </button>
-              {task.status !== "running" && (
+              {task.status !== "running" && task.status !== "queued" && (
                 <button className="recent-delete" title="删除任务" onClick={() => void deleteTask(task)}>
                   <Trash2 size={14} />
                 </button>
@@ -1345,7 +1436,7 @@ export default function App() {
               </div>
               {activeTask && (
                 <div className="progress-summary">
-                  <span>处理中</span>
+                  <span>{activeTask.status === "queued" ? "排队中" : "处理中"}</span>
                   <strong>{completedPages}</strong>
                   <span>/ {activeTask.pages.length || "—"} 页</span>
                   {activeTask.summary?.strict_overall_score != null && (
@@ -1389,24 +1480,26 @@ export default function App() {
                 </div>
                 {error && <div className="task-error"><XCircle size={17} /><span>{error}</span><button onClick={() => setError("")}>关闭</button></div>}
                 <div className="page-list">
-                  {activeTask.pages.map((page) => (
+                  {activeTask.pages.map((page, index) => (
                     <PageCard
                       key={page.page_id}
                       page={page}
+                      pageNumber={index + 1}
                       selected={page.page_id === selectedPage?.page_id}
                       onClick={() => setSelectedPageId(page.page_id)}
                       onRetryPage={(failedPage) => void retryFailedPages(activeTask, [failedPage.page_id])}
+                      onOpenMenu={(target, x, y) => setPageContextMenu({ task: activeTask, page: target, x, y })}
                       retryQueued={Boolean(
                         activeTask.retry_page_ids?.includes(page.page_id)
                         || (activeTask.retry_queued && !(activeTask.retry_page_ids?.length)),
                       )}
                     />
                   ))}
-                  {activeTask.status === "running" && !activeTask.pages.length && (
+                  {(activeTask.status === "running" || activeTask.status === "queued") && !activeTask.pages.length && (
                     <div className="processing-placeholder">
                       <LoaderCircle size={26} />
-                      <strong>正在分析视频时间线</strong>
-                      <span>确认第一页后会立即显示在这里</span>
+                      <strong>{activeTask.status === "queued" ? "任务正在排队" : "正在分析视频时间线"}</strong>
+                      <span>{activeTask.status === "queued" ? "前面的任务结束后会自动开始" : "确认第一页后会立即显示在这里"}</span>
                     </div>
                   )}
                 </div>
@@ -1415,6 +1508,7 @@ export default function App() {
           </main>
           <Inspector
             page={selectedPage}
+            pageNumber={selectedPageNumber}
             task={activeTask}
             settings={settings}
             onRetryPage={(page) => activeTask && void retryFailedPages(activeTask, [page.page_id])}
@@ -1428,7 +1522,7 @@ export default function App() {
         <div className={failedPages ? "has-error" : ""}><XCircle size={16} /><strong>{failedPages}</strong><span>个错误</span></div>
         <div className="status-spacer" />
         <div><span>模型</span><strong className="model-name">{settings.llm_model || "MiMo"}</strong></div>
-        <div><Activity size={16} className="pulse" /><span>{activeTask?.status === "running" ? "服务活动中" : "服务待命"}</span></div>
+        <div><Activity size={16} className="pulse" /><span>{hasRunningTask ? "服务活动中" : "服务待命"}</span></div>
       </footer>
 
       {reportTask && (
@@ -1439,8 +1533,68 @@ export default function App() {
           onRetryPage={(page) => void retryFailedPages(reportTask, [page.page_id])}
         />
       )}
+
+      {pageContextMenu && (
+        <div
+          className="page-context-layer"
+          onMouseDown={() => setPageContextMenu(null)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            setPageContextMenu(null);
+          }}
+        >
+          <div
+            className="page-context-menu"
+            role="menu"
+            style={{
+              left: Math.min(pageContextMenu.x, window.innerWidth - 180),
+              top: Math.min(pageContextMenu.y, window.innerHeight - 100),
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button onClick={() => window.location.reload()}>
+              <RotateCcw size={15} />刷新界面
+            </button>
+            <button
+              className="danger"
+              onClick={() => {
+                const { task, page } = pageContextMenu;
+                setPageContextMenu(null);
+                void deletePage(task, page);
+              }}
+            >
+              <Trash2 size={15} />删除此页
+            </button>
+          </div>
+        </div>
+      )}
       {showSettings && <SettingsModal settings={settings} onSave={saveSettings} onClose={() => setShowSettings(false)} />}
-      {showNewTask && <NewTaskModal settings={settings} onStart={startTask} onClose={() => setShowNewTask(false)} />}
+      {showNewTask && <NewTaskModal settings={settings} onStart={startTasks} onClose={() => setShowNewTask(false)} />}
+      {deleteCandidate && (
+        <div className="modal-backdrop">
+          <div className="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-task-title">
+            <div className="modal-header">
+              <div>
+                <h2 id="delete-task-title">删除任务</h2>
+                <p>此操作无法撤销</p>
+              </div>
+              <button className="icon-button" onClick={() => setDeleteCandidate(null)} aria-label="关闭">
+                <X size={19} />
+              </button>
+            </div>
+            <div className="confirm-modal-body">
+              <span className="confirm-modal-icon"><Trash2 size={21} /></span>
+              <p>确定删除“{deleteCandidate.video_id}”吗？任务结果、转写和分析报告都会一并删除。</p>
+            </div>
+            <div className="modal-actions">
+              <button className="button secondary" onClick={() => setDeleteCandidate(null)}>取消</button>
+              <button className="button danger" onClick={() => void confirmDeleteTask()}>
+                <Trash2 size={15} />删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

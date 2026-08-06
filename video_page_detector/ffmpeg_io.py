@@ -7,8 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Windows: prevent ffmpeg subprocess from inheriting Worker's stdin pipe
-# (which Rust holds open), and match the CREATE_NO_WINDOW flag Rust uses.
+# Prevent FFmpeg from inheriting and consuming Worker's command pipe.
 _SUBPROCESS_KWARGS = (
     {"stdin": subprocess.DEVNULL, "creationflags": subprocess.CREATE_NO_WINDOW}
     if sys.platform == "win32"

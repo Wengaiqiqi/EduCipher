@@ -118,7 +118,8 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<WorkerProcess, String> {
 
     let stderr_app = app.clone();
     let stderr_handle = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for bytes in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
+            let line = String::from_utf8_lossy(&bytes).into_owned();
             match stderr_lines.lock() {
                 Ok(mut guard) => {
                     if guard.len() < 500 {

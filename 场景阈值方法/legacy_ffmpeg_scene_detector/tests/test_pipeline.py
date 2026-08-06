@@ -158,7 +158,7 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertTrue((output / "class_01" / "page_001.jpg").is_file())
             self.assertTrue((output / "class_01" / "page_002.jpg").is_file())
             with Image.open(output / "class_01" / "page_001.jpg") as screenshot:
-                self.assertEqual(screenshot.size, (1024, 634))
+                self.assertEqual(screenshot.size, (1280, 720))
             self.assertTrue(audit_path.is_file())
             self.assertEqual(progress_events[-1], ("处理完成", 1.0))
 

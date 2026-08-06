@@ -30,7 +30,7 @@ from .mimo_asr import resolve_mimo_api_key
 
 
 APP_NAME = "课堂PPT智能处理"
-APP_VERSION = "1.4.11"
+APP_VERSION = "1.4.17"
 LOCAL_ASR_LABEL = "本地 faster-whisper"
 MIMO_ASR_LABEL = "小米 MiMo 云端（推荐加速）"
 VIDEO_FILE_TYPES = [

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -58,8 +57,6 @@ class VideoPageDetector:
             analysis_height=self.config.temporal_analysis_height,
         )
         report("正在读取视频信息", 0.03)
-        sys.stderr.write(f"[DEBUG] probing video: {source}\n")
-        sys.stderr.flush()
         metadata = feature_tools.probe(source)
         output_tools = FFmpegTools(
             ffmpeg_path=self.config.ffmpeg_path,

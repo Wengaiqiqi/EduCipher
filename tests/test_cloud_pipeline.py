@@ -10,6 +10,47 @@ from video_page_detector.transcription import TranscriptionConfig
 
 
 class CloudPagePipelineTests(unittest.TestCase):
+    def test_deleted_page_skips_queued_asr_and_is_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+            first_started = threading.Event()
+            release = threading.Event()
+            requested: list[int] = []
+
+            def asr_runner(page: dict) -> tuple[dict, dict]:
+                requested.append(int(page["page_id"]))
+                first_started.set()
+                release.wait(timeout=2)
+                return {**page, "speech_text": "讲话", "utterances": []}, {}
+
+            pipeline = CloudPagePipeline(
+                video_path=video,
+                result_path=root / "result.json",
+                output_dir=root,
+                transcription_config=TranscriptionConfig(
+                    engine="mimo-cloud",
+                    mimo_max_concurrency=1,
+                ),
+                asr_api_key="",
+                asr_runner=asr_runner,
+            )
+            pages = [
+                {"page_id": page_id, "start_sec": page_id - 1, "end_sec": page_id}
+                for page_id in (1, 2)
+            ]
+            pipeline.submit_page(pages[0], 1, 2)
+            pipeline.submit_page(pages[1], 2, 2)
+            self.assertTrue(first_started.wait(timeout=1))
+            pipeline.delete_page(2)
+            release.set()
+
+            transcript, _ = pipeline.finish({"video_id": "lesson", "pages": pages})
+
+            self.assertEqual(requested, [1])
+            self.assertEqual([page["page_id"] for page in transcript["pages"]], [1])
+
     def test_combined_cloud_concurrency_is_capped_at_ten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -45,6 +86,60 @@ class CloudPagePipelineTests(unittest.TestCase):
                 ],
                 10,
             )
+
+    def test_asr_concurrency_is_shared_across_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "lesson.mp4"
+            video.write_bytes(b"video")
+            release = threading.Event()
+            two_started = threading.Event()
+            lock = threading.Lock()
+            current = 0
+            peak = 0
+
+            def asr_runner(page: dict) -> tuple[dict, dict]:
+                nonlocal current, peak
+                with lock:
+                    current += 1
+                    peak = max(peak, current)
+                    if current == 2:
+                        two_started.set()
+                release.wait(timeout=3)
+                with lock:
+                    current -= 1
+                return {**page, "utterances": []}, {}
+
+            pipelines = [
+                CloudPagePipeline(
+                    video_path=video,
+                    result_path=root / f"task-{index}" / "result.json",
+                    output_dir=root / f"task-{index}",
+                    transcription_config=TranscriptionConfig(
+                        engine="mimo-cloud",
+                        mimo_max_concurrency=2,
+                    ),
+                    asr_api_key="",
+                    asr_runner=asr_runner,
+                )
+                for index in (1, 2)
+            ]
+            pages = [
+                {"page_id": page_id, "start_sec": page_id - 1, "end_sec": page_id}
+                for page_id in range(1, 4)
+            ]
+            for pipeline in pipelines:
+                for page_id, page in enumerate(pages, start=1):
+                    pipeline.submit_page(page, page_id, len(pages))
+
+            self.assertTrue(two_started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(peak, 2)
+            release.set()
+            for pipeline in pipelines:
+                pipeline.finish({"video_id": "lesson", "pages": pages})
+
+            self.assertEqual(peak, 2)
 
     def test_cloud_activity_reports_real_active_and_peak_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

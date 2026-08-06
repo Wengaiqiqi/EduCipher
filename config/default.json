@@ -11,7 +11,7 @@
   "screen_crop_top_ratio": 0.02,
   "screen_crop_right_ratio": 0.1,
   "screen_crop_bottom_ratio": 0.1,
-  "crop_output_screenshots": true,
+  "crop_output_screenshots": false,
   "grid_columns": 4,
   "grid_rows": 3,
   "block_hash_distance": 10,

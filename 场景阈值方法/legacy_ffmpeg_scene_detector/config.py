@@ -18,7 +18,7 @@ class DetectorConfig:
     screen_crop_top_ratio: float = 0.02
     screen_crop_right_ratio: float = 0.10
     screen_crop_bottom_ratio: float = 0.10
-    crop_output_screenshots: bool = True
+    crop_output_screenshots: bool = False
     grid_columns: int = 4
     grid_rows: int = 3
     block_hash_distance: int = 10

@@ -1181,6 +1181,44 @@ select:focus-visible {
   font-size: 14px;
 }
 
+.page-context-layer {
+  position: fixed;
+  z-index: 300;
+  inset: 0;
+}
+
+.page-context-menu {
+  position: fixed;
+  width: 170px;
+  padding: 5px;
+  border: 1px solid #343b48;
+  border-radius: 8px;
+  background: #191d24;
+  box-shadow: 0 12px 35px rgba(0, 0, 0, 0.38);
+}
+
+.page-context-menu button {
+  width: 100%;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 5px;
+  color: #d7dde6;
+  background: transparent;
+  cursor: pointer;
+}
+
+.page-context-menu button:hover {
+  background: #252b35;
+}
+
+.page-context-menu button.danger {
+  color: var(--red);
+}
+
 .pulse {
   color: var(--green) !important;
   animation: pulse-scale 1.5s ease-in-out infinite;
@@ -1209,6 +1247,35 @@ select:focus-visible {
 
 .settings-modal {
   width: min(820px, calc(100vw - 60px));
+}
+
+.confirm-modal {
+  width: min(470px, calc(100vw - 40px));
+  overflow: hidden;
+}
+
+.confirm-modal-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 24px 25px;
+}
+
+.confirm-modal-body p {
+  margin: 1px 0 0;
+  color: var(--text);
+  line-height: 1.7;
+}
+
+.confirm-modal-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
 }
 
 .modal-header {
@@ -1286,6 +1353,26 @@ select:focus-visible {
   min-width: 0;
   flex: 1;
   text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-video-list {
+  display: grid;
+  gap: 6px;
+  max-height: 130px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid #303846;
+  border-radius: 7px;
+  color: #8f9aac;
+  background: #151920;
+  font-size: 12px;
+}
+
+.selected-video-list span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1410,6 +1497,16 @@ select:focus-visible {
   border: 1px solid #353d49;
   background: #20242c;
   color: #aeb8c7;
+}
+
+.button.danger {
+  border: 1px solid #dc4c57;
+  background: linear-gradient(180deg, #e5535e, #c93b46);
+  color: #fff;
+}
+
+.button.danger:hover {
+  filter: brightness(1.08);
 }
 
 .settings-grid {
@@ -1740,6 +1837,7 @@ select:focus-visible {
 .light .modal,
 .light .settings-grid section,
 .light .new-task-modal .task-form,
+.light .selected-video-list,
 .light .cloud-auth-card {
   background: var(--panel);
   border-color: var(--border-soft);
@@ -1747,6 +1845,7 @@ select:focus-visible {
 .light .modal-actions,
 .light .settings-grid section,
 .light .new-task-modal .task-form,
+.light .selected-video-list,
 .light .cloud-auth-card {
   background: var(--panel);
   color: var(--text);
@@ -1758,6 +1857,24 @@ select:focus-visible {
 .light .modal-backdrop {
   background: rgba(15, 23, 42, 0.25);
   backdrop-filter: blur(4px);
+}
+
+.light .page-context-menu {
+  border-color: var(--border-soft);
+  background: var(--panel);
+  box-shadow: 0 12px 35px rgba(15, 23, 42, 0.18);
+}
+
+.light .page-context-menu button {
+  color: var(--text);
+}
+
+.light .page-context-menu button:hover {
+  background: #eef2f7;
+}
+
+.light .page-context-menu button.danger {
+  color: var(--red);
 }
 .light .workspace-header,
 .light .report-list h2,

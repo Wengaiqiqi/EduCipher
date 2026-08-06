@@ -78,6 +78,29 @@ class StreamingTemporalPipelineTests(unittest.TestCase):
         "video_page_detector.streaming_pipeline.FFmpegTools",
         _StreamingFakeFFmpegTools,
     )
+    def test_detection_does_not_depend_on_stderr(self) -> None:
+        class BrokenStderr:
+            def write(self, *_: object) -> None:
+                raise OSError(22, "Invalid argument")
+
+            flush = write
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "class.mp4"
+            video.write_bytes(b"fake")
+            with patch("sys.stderr", BrokenStderr()):
+                result = StreamingVideoPageDetector(self._config()).run(
+                    video,
+                    output_root=root / "streaming",
+                    video_id="lesson",
+                )
+        self.assertTrue(result["pages"])
+
+    @patch(
+        "video_page_detector.streaming_pipeline.FFmpegTools",
+        _StreamingFakeFFmpegTools,
+    )
     @patch(
         "video_page_detector.batch_pipeline.FFmpegTools",
         _StreamingFakeFFmpegTools,

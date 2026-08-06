@@ -4,28 +4,162 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
 from video_page_detector.desktop_v2_worker import (
+    delete_task_page,
     delete_task_result,
     detector_algorithm,
     discover_original_video,
+    emit,
     emit_page,
     handle_command,
     llm_config,
     list_tasks,
+    launch_pending_work,
     load_run_elapsed,
     load_task,
     page_speech_text,
+    replay_active_events,
+    run_task,
     run_retry_failed_pages,
     scene_threshold_detector_config,
+    start_task,
     start_retry_failed_pages,
     transcription_config,
 )
 
 
 class DesktopV2WorkerTests(unittest.TestCase):
+    def test_pending_tasks_launch_in_fifo_order(self) -> None:
+        pending: deque[dict] = deque([
+            {"_queue_id": "queue-1", "video_id": "one"},
+            {"_queue_id": "queue-2", "video_id": "two"},
+        ])
+        with (
+            patch("video_page_detector.desktop_v2_worker._active_thread", None),
+            patch("video_page_detector.desktop_v2_worker._detection_busy", False),
+            patch("video_page_detector.desktop_v2_worker._active_task_dirs", set()),
+            patch("video_page_detector.desktop_v2_worker._pending_task_payloads", pending),
+            patch("video_page_detector.desktop_v2_worker._pending_retry_payload", None),
+            patch("video_page_detector.desktop_v2_worker.threading.Thread") as thread,
+            patch("video_page_detector.desktop_v2_worker.emit") as emit,
+        ):
+            launch_pending_work()
+
+        self.assertEqual(thread.call_args.kwargs["target"], run_task)
+        self.assertEqual(thread.call_args.kwargs["args"][0]["video_id"], "one")
+        thread.return_value.start.assert_called_once_with()
+        emit.assert_called_once_with(
+            "task.queue_updated", task_id="queue-2", queue_position=1
+        )
+
+    def test_new_task_is_queued_while_another_task_is_running(self) -> None:
+        pending: deque[dict] = deque()
+        with (
+            patch("video_page_detector.desktop_v2_worker._detection_busy", True),
+            patch("video_page_detector.desktop_v2_worker._pending_task_payloads", pending),
+            patch("video_page_detector.desktop_v2_worker.time.time_ns", return_value=123),
+            patch("video_page_detector.desktop_v2_worker.emit") as emit,
+        ):
+            start_task({"video_path": "two.mp4", "video_id": "two", "mode": "full"})
+
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["_queue_id"], "queue-123")
+        emit.assert_called_once_with(
+            "task.queued",
+            task_id="queue-123",
+            video_id="two",
+            video_path="two.mp4",
+            queue_position=1,
+            mode="full",
+            include_llm=True,
+        )
+
+    def test_new_task_starts_while_previous_task_only_uses_cloud(self) -> None:
+        with (
+            patch("video_page_detector.desktop_v2_worker._detection_busy", False),
+            patch(
+                "video_page_detector.desktop_v2_worker._active_task_dirs",
+                {Path("previous-task")},
+            ),
+            patch("video_page_detector.desktop_v2_worker.threading.Thread") as thread,
+        ):
+            start_task({"video_path": "next.mp4", "video_id": "next"})
+
+        thread.return_value.start.assert_called_once_with()
+        self.assertEqual(thread.call_args.kwargs["target"], run_task)
+
+    def test_active_events_replay_after_frontend_refresh(self) -> None:
+        with patch("video_page_detector.desktop_v2_worker._write_event") as write:
+            emit("task.started", task_id="task-1")
+            emit("page.updated", task_id="task-1", page={"page_id": 1})
+            write.reset_mock()
+
+            replay_active_events()
+
+            self.assertEqual(
+                [call.args[0]["type"] for call in write.call_args_list],
+                ["task.started", "page.updated"],
+            )
+            emit("task.completed", task_id="task-1")
+
+    def test_completed_page_delete_removes_and_renumbers_all_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = root / "lesson"
+            evaluation_dir = run_dir / "llm_evaluation"
+            evaluation_dir.mkdir(parents=True)
+            pages = [
+                {
+                    "page_id": page_id,
+                    "start_sec": page_id - 1,
+                    "end_sec": page_id,
+                    "screenshot_path": f"page_{page_id:03d}.jpg",
+                }
+                for page_id in (1, 2, 3)
+            ]
+            (run_dir / "result.json").write_text(
+                json.dumps({"video_id": "lesson", "pages": pages}), encoding="utf-8"
+            )
+            (run_dir / "transcript.json").write_text(
+                json.dumps({
+                    "video_id": "lesson",
+                    "pages": [{**page, "utterances": []} for page in pages],
+                    "transcription": {"cloud_statistics": {"failed_page_count": 0}},
+                }),
+                encoding="utf-8",
+            )
+            (evaluation_dir / "llm_evaluation.json").write_text(
+                json.dumps({
+                    "video_id": "lesson",
+                    "model": "test-model",
+                    "prompt_version": "test",
+                    "pages": [
+                        {"page_id": page_id, "status": "scored", "score": 80}
+                        for page_id in (1, 2, 3)
+                    ],
+                    "summary": {},
+                }),
+                encoding="utf-8",
+            )
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps({"status": "completed", "mode": "full", "include_llm": True}),
+                encoding="utf-8",
+            )
+
+            task = delete_task_page(str(run_dir), 2, str(root))
+
+            self.assertIsNotNone(task)
+            self.assertEqual([page["page_id"] for page in task["pages"]], [1, 2])
+            self.assertTrue(task["pages"][1]["screenshot_path"].endswith("page_003.jpg"))
+            evaluation = json.loads(
+                (evaluation_dir / "llm_evaluation.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evaluation["summary"]["total_pages"], 2)
+
     def test_page_update_emits_task_id_at_event_top_level(self) -> None:
         with patch("video_page_detector.desktop_v2_worker.emit") as emit:
             emit_page({"page_id": 1}, "detected", task_id="task-1")
@@ -38,7 +172,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
         with patch("video_page_detector.desktop_v2_worker.emit") as emit:
             handle_command({"action": "ping"})
         self.assertEqual(emit.call_args.args, ("worker.ready",))
-        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.11")
+        self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.17")
 
     def test_detailed_evidence_setting_reaches_llm_config(self) -> None:
         self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
@@ -103,12 +237,10 @@ class DesktopV2WorkerTests(unittest.TestCase):
     def test_retry_is_queued_while_main_task_is_running(self) -> None:
         payload = {"task_id": "task-1", "page_ids": [2]}
         with (
-            patch("video_page_detector.desktop_v2_worker._active_thread") as active,
+            patch("video_page_detector.desktop_v2_worker._detection_busy", True),
             patch("video_page_detector.desktop_v2_worker._pending_retry_payload", None),
             patch("video_page_detector.desktop_v2_worker.emit") as emit,
         ):
-            active.is_alive.return_value = True
-
             start_retry_failed_pages(payload)
 
         emit.assert_called_once_with(
@@ -625,22 +757,11 @@ class DesktopV2WorkerTests(unittest.TestCase):
                 json.dumps({"status": "running", "mode": "full"}),
                 encoding="utf-8",
             )
-            active_thread = threading.Thread(target=lambda: time.sleep(0.2))
-            active_thread.start()
-            try:
-                with (
-                    patch(
-                        "video_page_detector.desktop_v2_worker._active_thread",
-                        active_thread,
-                    ),
-                    patch(
-                        "video_page_detector.desktop_v2_worker._active_task_dir",
-                        run_dir.resolve(),
-                    ),
-                ):
-                    task = load_task(run_dir)
-            finally:
-                active_thread.join()
+            with patch(
+                "video_page_detector.desktop_v2_worker._active_task_dirs",
+                {run_dir.resolve()},
+            ):
+                task = load_task(run_dir)
 
             self.assertIsNotNone(task)
             assert task is not None
@@ -686,22 +807,11 @@ class DesktopV2WorkerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            active_thread = threading.Thread(target=lambda: time.sleep(0.2))
-            active_thread.start()
-            try:
-                with (
-                    patch(
-                        "video_page_detector.desktop_v2_worker._active_thread",
-                        active_thread,
-                    ),
-                    patch(
-                        "video_page_detector.desktop_v2_worker._active_task_dir",
-                        run_dir.resolve(),
-                    ),
-                ):
-                    task = load_task(run_dir)
-            finally:
-                active_thread.join()
+            with patch(
+                "video_page_detector.desktop_v2_worker._active_task_dirs",
+                {run_dir.resolve()},
+            ):
+                task = load_task(run_dir)
 
             assert task is not None
             self.assertEqual(task["status"], "completed")
@@ -930,13 +1040,11 @@ class DesktopV2WorkerTests(unittest.TestCase):
             )
 
             with (
-                patch("video_page_detector.desktop_v2_worker._active_thread") as thread,
                 patch(
-                    "video_page_detector.desktop_v2_worker._active_task_dir",
-                    run_dir.resolve(),
+                    "video_page_detector.desktop_v2_worker._active_task_dirs",
+                    {run_dir.resolve()},
                 ),
             ):
-                thread.is_alive.return_value = True
                 with self.assertRaisesRegex(RuntimeError, "不能删除"):
                     delete_task_result(str(run_dir), temp)
 

@@ -29,7 +29,7 @@ export interface TaskRecord {
   video_path?: string;
   run_dir: string;
   updated_at?: number;
-  status: "idle" | "running" | "completed" | "completed_with_errors" | "failed";
+  status: "idle" | "queued" | "running" | "completed" | "completed_with_errors" | "failed";
   progress?: number;
   stage?: string;
   stage_progress?: number;
@@ -46,6 +46,7 @@ export interface TaskRecord {
   mode?: "full" | "detect";
   include_llm?: boolean;
   include_evidence?: boolean;
+  queue_position?: number;
   retry_queued?: boolean;
   retry_page_ids?: number[];
   retry_asr_concurrency?: number;
@@ -100,6 +101,11 @@ export interface WorkerEvent {
   stage_progress?: number;
   completed_stage?: "ppt" | "voice" | "llm" | "report";
   page?: PageRecord;
+  page_id?: number;
+  queue_id?: string;
+  queue_position?: number;
+  video_id?: string;
+  video_path?: string;
   pages?: PageRecord[];
   page_ids?: number[];
   result?: TaskRecord;

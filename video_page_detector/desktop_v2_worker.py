@@ -46,28 +46,104 @@ from 场景阈值方法.legacy_ffmpeg_scene_detector.pipeline import (
 
 _output_lock = threading.Lock()
 _task_lock = threading.Lock()
+_local_asr_lock = threading.Lock()
+_local_llm_lock = threading.Lock()
 _cancel_event = threading.Event()
 _active_thread: threading.Thread | None = None
 _active_task_dir: Path | None = None
+_detection_busy = False
+_active_task_dirs: set[Path] = set()
+_active_cloud_pipelines: dict[Path, CloudPagePipeline] = {}
 _pending_retry_payload: dict[str, Any] | None = None
+_pending_task_payloads: deque[dict[str, Any]] = deque()
+_active_events: list[dict[str, Any]] = []
+
+_REPLAYED_EVENT_TYPES = {
+    "task.started",
+    "task.retry_started",
+    "task.retry_queued",
+    "task.progress",
+    "page.updated",
+    "page.deleted",
+    "cloud.activity",
+}
+
+
+def _write_event(message: Mapping[str, Any]) -> None:
+    line = json.dumps(message, ensure_ascii=False) + "\n"
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout.buffer.write(line.encode("utf-8", "replace"))
+            sys.stdout.buffer.flush()
+        else:
+            sys.stdout.write(
+                line.encode("utf-8", "replace").decode("ascii", "replace")
+            )
+            sys.stdout.flush()
 
 
 def emit(event_type: str, **payload: Any) -> None:
     message = {"type": event_type, **payload}
     with _output_lock:
-        line = json.dumps(message, ensure_ascii=False) + "\n"
-        try:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-        except UnicodeEncodeError:
-            if hasattr(sys.stdout, "buffer"):
-                sys.stdout.buffer.write(line.encode("utf-8", "replace"))
-                sys.stdout.buffer.flush()
-            else:
-                sys.stdout.write(
-                    line.encode("utf-8", "replace").decode("ascii", "replace")
-                )
-                sys.stdout.flush()
+        task_id = str(payload.get("task_id") or "")
+        if event_type in {"task.started", "task.retry_started"} and task_id:
+            _active_events[:] = [
+                event for event in _active_events
+                if str(event.get("task_id") or "") != task_id
+            ]
+        should_replay = event_type in _REPLAYED_EVENT_TYPES and not (
+            event_type == "page.deleted" and payload.get("result") is not None
+        )
+        if should_replay:
+            if event_type == "page.deleted":
+                page_id = int(payload.get("page_id") or 0)
+                _active_events[:] = [
+                    event for event in _active_events
+                    if not (
+                        event.get("type") == "page.updated"
+                        and isinstance(event.get("page"), Mapping)
+                        and int(event["page"].get("page_id") or 0) == page_id
+                    )
+                ]
+            _active_events.append(message)
+        _write_event(message)
+        if event_type in {"task.completed", "task.retry_completed", "task.failed", "task.retry_failed", "task.deleted"} and task_id:
+            _active_events[:] = [
+                event for event in _active_events
+                if str(event.get("task_id") or "") != task_id
+            ]
+
+
+def replay_active_events() -> None:
+    with _task_lock:
+        queued = list(_pending_task_payloads)
+        with _output_lock:
+            for message in _active_events:
+                _write_event(message)
+            for position, payload in enumerate(queued, start=1):
+                _write_event(queued_task_event(payload, position))
+
+
+def queued_task_event(payload: Mapping[str, Any], position: int) -> dict[str, Any]:
+    video = Path(str(payload.get("video_path") or ""))
+    settings = payload.get("settings", {})
+    mode = str(payload.get("mode") or "full")
+    return {
+        "type": "task.queued",
+        "task_id": str(payload.get("_queue_id") or ""),
+        "video_id": str(payload.get("video_id") or video.stem),
+        "video_path": str(video),
+        "queue_position": position,
+        "mode": mode,
+        "include_llm": bool(
+            mode == "full"
+            and isinstance(settings, Mapping)
+            and settings.get("include_llm", True)
+        ),
+    }
 
 
 def project_root() -> Path:
@@ -311,17 +387,15 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         run_dir / "llm_evaluation" / "llm_evaluation.json"
     )
     metadata = read_json(run_metadata_path(run_dir)) or {}
+    deleted_ids = deleted_page_ids(run_dir)
     metadata_status = str(metadata.get("status") or "")
     mode = str(
         metadata.get("mode")
         or ("full" if transcript or evaluation else "detect")
     )
     include_llm = bool(metadata.get("include_llm", bool(evaluation)))
-    actively_running = bool(
-        _active_thread is not None
-        and _active_thread.is_alive()
-        and _active_task_dir == run_dir.resolve()
-    )
+    with _task_lock:
+        actively_running = run_dir.resolve() in _active_task_dirs
     interrupted = (
         metadata_status in {"running", "retrying"} and not actively_running
     ) or metadata_status in {"failed", "cancelled"}
@@ -342,6 +416,8 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
         if not isinstance(page, Mapping) or "page_id" not in page:
             continue
         page_id = int(page["page_id"])
+        if page_id in deleted_ids:
+            continue
         page_map[page_id] = {**dict(page), "status": "detected"}
         row = page_map[page_id]
         row["screenshot_path"] = resolve_screenshot_path(page, run_dir)
@@ -350,6 +426,8 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             if not isinstance(page, Mapping) or "page_id" not in page:
                 continue
             page_id = int(page["page_id"])
+            if page_id in deleted_ids:
+                continue
             row = page_map.setdefault(page_id, {"page_id": page_id})
             # preserve resolved screenshot_path from detection
             existing_screenshot = row.get("screenshot_path", "")
@@ -369,6 +447,8 @@ def load_task(run_dir: Path) -> dict[str, Any] | None:
             if not isinstance(page, Mapping) or "page_id" not in page:
                 continue
             page_id = int(page["page_id"])
+            if page_id in deleted_ids:
+                continue
             row = page_map.setdefault(page_id, {"page_id": page_id})
             # evaluation dict lacks screenshot_path/speech_text, so preserve existing
             for key, value in page.items():
@@ -595,15 +675,131 @@ def resolve_existing_task_dir(
 def delete_task_result(task_id: str, output_root: str | None = None) -> Path:
     run_dir = resolve_existing_task_dir(task_id, output_root)
     with _task_lock:
-        is_actively_running = bool(
-            _active_thread is not None
-            and _active_thread.is_alive()
-            and _active_task_dir == run_dir
-        )
+        is_actively_running = run_dir in _active_task_dirs
     if is_actively_running:
         raise RuntimeError("正在处理或重试的任务不能删除。")
     shutil.rmtree(run_dir)
     return run_dir
+
+
+def deleted_page_ids(run_dir: Path) -> set[int]:
+    metadata = read_json(run_metadata_path(run_dir)) or {}
+    return {
+        int(value)
+        for value in metadata.get("deleted_page_ids", [])
+        if str(value).isdigit()
+    }
+
+
+def normalize_deleted_pages(run_dir: Path, deleted_ids: set[int]) -> None:
+    """Remove deleted pages and make page_id continuous across persisted outputs."""
+    detection = read_json(run_dir / "result.json")
+    if not detection or not isinstance(detection.get("pages"), list):
+        return
+    kept = [
+        dict(page)
+        for page in detection["pages"]
+        if isinstance(page, Mapping)
+        and int(page.get("page_id") or 0) not in deleted_ids
+    ]
+    id_map = {
+        int(page["page_id"]): index
+        for index, page in enumerate(kept, start=1)
+    }
+    for page in kept:
+        page["page_id"] = id_map[int(page["page_id"])]
+    detection["pages"] = kept
+    write_json(run_dir / "result.json", detection)
+
+    transcript_path = run_dir / "transcript.json"
+    transcript = read_json(transcript_path)
+    if transcript and isinstance(transcript.get("pages"), list):
+        transcript_pages = [
+            dict(page)
+            for page in transcript["pages"]
+            if isinstance(page, Mapping)
+            and int(page.get("page_id") or 0) in id_map
+        ]
+        for page in transcript_pages:
+            page["page_id"] = id_map[int(page["page_id"])]
+        transcript["pages"] = transcript_pages
+        transcription = transcript.get("transcription", {})
+        if isinstance(transcription, dict):
+            transcription["utterance_count"] = sum(
+                len(page.get("utterances", [])) for page in transcript_pages
+            )
+            cloud = transcription.get("cloud_statistics", {})
+            if isinstance(cloud, dict):
+                cloud["page_request_count"] = len(transcript_pages)
+                cloud["failed_page_count"] = sum(
+                    page.get("failure_stage") == "asr"
+                    or page.get("transcription_status") == "failed"
+                    for page in transcript_pages
+                )
+        write_json(transcript_path, transcript)
+        (run_dir / "逐页语音文字.md").write_text(
+            render_page_transcripts_markdown(
+                str(transcript.get("video_id") or run_dir.name),
+                transcript_pages,
+            ),
+            encoding="utf-8",
+        )
+
+    evaluation_path = run_dir / "llm_evaluation" / "llm_evaluation.json"
+    evaluation = read_json(evaluation_path)
+    if evaluation and isinstance(evaluation.get("pages"), list):
+        evaluation_pages = [
+            dict(page)
+            for page in evaluation["pages"]
+            if isinstance(page, Mapping)
+            and int(page.get("page_id") or 0) in id_map
+        ]
+        for page in evaluation_pages:
+            page["page_id"] = id_map[int(page["page_id"])]
+        evaluation["pages"] = evaluation_pages
+        evaluation["summary"] = summarize_evaluations(evaluation_pages)
+        write_json(evaluation_path, evaluation)
+        report_path = run_dir / "llm_evaluation" / "PPT讲话关联度报告.md"
+        report_path.write_text(
+            render_evaluation_markdown(evaluation),
+            encoding="utf-8",
+        )
+
+
+def delete_task_page(
+    task_id: str,
+    page_id: int,
+    output_root: str | None = None,
+) -> dict[str, Any] | None:
+    if page_id <= 0:
+        raise ValueError("页码不正确。")
+    run_dir = Path(task_id).expanduser().resolve()
+    if not any(run_dir.parent == root for root in task_roots(output_root)):
+        raise ValueError("任务目录不在允许的结果目录中。")
+    with _task_lock:
+        active = run_dir in _active_task_dirs
+        pipeline = _active_cloud_pipelines.get(run_dir)
+    if not active and load_task(run_dir) is None:
+        raise FileNotFoundError("任务结果不存在或已经被删除。")
+
+    metadata = read_json(run_metadata_path(run_dir)) or {}
+    ids = deleted_page_ids(run_dir)
+    ids.add(page_id)
+    metadata["deleted_page_ids"] = sorted(ids)
+    write_json(run_metadata_path(run_dir), metadata)
+    if pipeline is not None:
+        pipeline.delete_page(page_id)
+    if active:
+        return None
+    normalize_deleted_pages(run_dir, ids)
+    metadata = read_json(run_metadata_path(run_dir)) or {}
+    metadata.pop("deleted_page_ids", None)
+    task = load_task(run_dir)
+    if task is not None:
+        has_errors = any(page.get("status") == "failed" for page in task["pages"])
+        metadata["status"] = "completed_with_errors" if has_errors else "completed"
+    write_json(run_metadata_path(run_dir), metadata)
+    return load_task(run_dir)
 
 
 def _write_retry_evaluation(
@@ -668,6 +864,7 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         )
         with _task_lock:
             _active_task_dir = run_dir
+            _active_task_dirs.add(run_dir)
         task_id = str(run_dir.resolve())
         detection = read_json(run_dir / "result.json") or {}
         transcript_path = run_dir / "transcript.json"
@@ -1166,6 +1363,12 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         )
         metadata["retry_peak_asr_concurrency"] = peak_asr
         metadata["retry_peak_llm_concurrency"] = peak_llm
+        ids_to_delete = deleted_page_ids(run_dir)
+        if ids_to_delete:
+            normalize_deleted_pages(run_dir, ids_to_delete)
+            metadata.pop("deleted_page_ids", None)
+            transcript = read_json(transcript_path) or transcript
+            evaluation = read_json(evaluation_path) or evaluation
         asr_failed = sum(
             page.get("failure_stage") == "asr"
             for page in transcript.get("pages", [])
@@ -1204,8 +1407,13 @@ def run_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         with _task_lock:
             if run_dir is not None and _active_task_dir == run_dir.resolve():
                 _active_task_dir = None
-        _cancel_event.clear()
-        launch_pending_retry()
+            if run_dir is not None:
+                _active_task_dirs.discard(run_dir.resolve())
+            no_active_tasks = not _active_task_dirs
+        if no_active_tasks:
+            _cancel_event.clear()
+        release_detection_slot()
+        launch_pending_work()
 
 
 def require_not_cancelled() -> None:
@@ -1315,6 +1523,8 @@ def emit_page(
     **extra: Any,
 ) -> None:
     payload = dict(page)
+    if task_id and int(payload.get("page_id") or 0) in deleted_page_ids(Path(task_id)):
+        return
     # 过滤掉值为 None 的 extra 字段，避免前端收到 null 覆盖已有数据
     payload.update((k, v) for k, v in extra.items() if v is not None)
     payload["status"] = status
@@ -1327,8 +1537,17 @@ def run_task(payload: Mapping[str, Any]) -> None:
     global _active_task_dir
     started_at = time.perf_counter()
     cloud_pipeline: CloudPagePipeline | None = None
-    task_id = ""
+    detection_released = False
+    task_id = str(payload.get("_queue_id") or "")
     run_dir: Path | None = None
+
+    def release_detection() -> None:
+        nonlocal detection_released
+        if detection_released:
+            return
+        detection_released = True
+        release_detection_slot()
+        launch_pending_work()
     try:
         video = Path(str(payload.get("video_path") or ""))
         if not video.is_file():
@@ -1343,8 +1562,12 @@ def run_task(payload: Mapping[str, Any]) -> None:
         if not isinstance(settings, Mapping):
             raise ValueError("桌面端设置格式不正确。")
         run_dir = resolve_run_directory(output_root, video_id)
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
         with _task_lock:
             _active_task_dir = run_dir.resolve()
+            _active_task_dirs.add(run_dir.resolve())
         result_path = run_dir / "result.json"
         transcript_path = run_dir / "transcript.json"
         evaluation_dir = run_dir / "llm_evaluation"
@@ -1355,11 +1578,12 @@ def run_task(payload: Mapping[str, Any]) -> None:
         emit(
             "task.started",
             task_id=task_id,
+            queue_id=str(payload.get("_queue_id") or ""),
             video_id=video_id,
             video_path=str(video.resolve()),
             run_dir=str(run_dir.resolve()),
             started_at=time.time(),
-            algorithm_version="1.4.11",
+            algorithm_version="1.4.17",
             streaming_page_confirmation=(selected_detector_algorithm == "temporal"),
             detector_algorithm=selected_detector_algorithm,
             mode=mode,
@@ -1496,6 +1720,8 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 ),
                 cancel_event=_cancel_event,
             )
+            with _task_lock:
+                _active_cloud_pipelines[run_dir.resolve()] = cloud_pipeline
 
         def detection_progress(message: str, progress: float | None) -> None:
             require_not_cancelled()
@@ -1561,6 +1787,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             stage_progress=100,
             completed_stage="ppt",
         )
+        release_detection()
         transcript: dict[str, Any] | None = None
         evaluation: dict[str, Any] | None = None
         if cloud_pipeline:
@@ -1572,7 +1799,6 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 progress=60,
             )
             transcript, evaluation = cloud_pipeline.finish(detection)
-            cloud_pipeline = None
         elif mode == "full" and transcribe_config:
             def transcription_progress(
                 message: str,
@@ -1588,14 +1814,23 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     stage_progress=round(float(progress or 0) * 100),
                 )
 
-            transcript = transcribe_video_pages(
-                video,
-                result_path,
-                config=transcribe_config,
-                output_dir=run_dir,
-                api_key=str(payload.get("asr_api_key") or "") or None,
-                progress_callback=transcription_progress,
-            )
+            with _local_asr_lock:
+                transcript = transcribe_video_pages(
+                    video,
+                    result_path,
+                    config=transcribe_config,
+                    output_dir=run_dir,
+                    api_key=str(payload.get("asr_api_key") or "") or None,
+                    progress_callback=transcription_progress,
+                )
+            ids_to_delete = deleted_page_ids(run_dir)
+            if ids_to_delete:
+                transcript["pages"] = [
+                    page for page in transcript.get("pages", [])
+                    if isinstance(page, Mapping)
+                    and int(page.get("page_id") or 0) not in ids_to_delete
+                ]
+                write_json(transcript_path, transcript)
             for page in transcript.get("pages", []):
                 if isinstance(page, Mapping):
                     emit_page(
@@ -1620,19 +1855,20 @@ def run_task(payload: Mapping[str, Any]) -> None:
                         stage_progress=round(completed / max(total, 1) * 100),
                     )
 
-                evaluation = evaluate_transcript(
-                    transcript_path,
-                    config=llm_settings,
-                    output_dir=evaluation_dir,
-                    api_key=llm_key,
-                    progress_callback=evaluation_progress,
-                    activity_callback=lambda active, limit: emit(
-                        "cloud.activity",
-                        task_id=task_id,
-                        active_cloud_requests=active,
-                        cloud_limit=limit,
-                    ),
-                )
+                with _local_llm_lock:
+                    evaluation = evaluate_transcript(
+                        transcript_path,
+                        config=llm_settings,
+                        output_dir=evaluation_dir,
+                        api_key=llm_key,
+                        progress_callback=evaluation_progress,
+                        activity_callback=lambda active, limit: emit(
+                            "cloud.activity",
+                            task_id=task_id,
+                            active_cloud_requests=active,
+                            cloud_limit=limit,
+                        ),
+                    )
                 evaluation_by_id = {
                     int(item["page_id"]): item
                     for item in evaluation.get("pages", [])
@@ -1651,6 +1887,15 @@ def run_task(payload: Mapping[str, Any]) -> None:
                     if matched is not None:
                         kwargs["evidence"] = matched
                     emit_page(page, "completed", task_id=task_id, **kwargs)
+
+        ids_to_delete = deleted_page_ids(run_dir)
+        if ids_to_delete:
+            normalize_deleted_pages(run_dir, ids_to_delete)
+            meta = read_json(run_metadata_path(run_dir)) or {}
+            meta.pop("deleted_page_ids", None)
+            write_json(run_metadata_path(run_dir), meta)
+            transcript = read_json(transcript_path)
+            evaluation = read_json(evaluation_dir / "llm_evaluation.json")
 
         elapsed_sec = round(time.perf_counter() - started_at, 3)
         # 先把精确耗时保存到 run_metadata.json，再 load_task，确保耗时能被读到
@@ -1703,6 +1948,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
             result=task,
         )
     except Exception as exc:
+        failure_traceback = traceback.format_exc()
         if cloud_pipeline is not None:
             cloud_pipeline.abort()
         if run_dir is not None:
@@ -1713,6 +1959,8 @@ def run_task(payload: Mapping[str, Any]) -> None:
                 meta["status"] = (
                     "cancelled" if _cancel_event.is_set() else "failed"
                 )
+                meta["error"] = str(exc)
+                meta["traceback"] = failure_traceback
                 run_metadata_path(run_dir).write_text(
                     json.dumps(meta, ensure_ascii=False) + "\n",
                     encoding="utf-8",
@@ -1723,23 +1971,37 @@ def run_task(payload: Mapping[str, Any]) -> None:
             "task.failed",
             task_id=task_id,
             error=str(exc),
-            traceback=traceback.format_exc(),
+            traceback=failure_traceback,
         )
     finally:
         with _task_lock:
             if run_dir is not None and _active_task_dir == run_dir.resolve():
                 _active_task_dir = None
-        _cancel_event.clear()
-        launch_pending_retry()
+            if run_dir is not None:
+                resolved_run_dir = run_dir.resolve()
+                _active_task_dirs.discard(resolved_run_dir)
+                if _active_cloud_pipelines.get(resolved_run_dir) is cloud_pipeline:
+                    _active_cloud_pipelines.pop(resolved_run_dir, None)
+            no_active_tasks = not _active_task_dirs
+        if no_active_tasks:
+            _cancel_event.clear()
+        release_detection()
+        launch_pending_work()
 
 
 def start_task(payload: Mapping[str, Any]) -> None:
-    global _active_thread
+    global _active_thread, _detection_busy
     with _task_lock:
-        if _active_thread is not None and _active_thread.is_alive():
-            emit("task.failed", error="已有任务正在处理中。")
+        if _detection_busy:
+            queued = dict(payload)
+            queued["_queue_id"] = f"queue-{time.time_ns()}"
+            _pending_task_payloads.append(queued)
+            event = queued_task_event(queued, len(_pending_task_payloads))
+            emit(str(event.pop("type")), **event)
             return
-        _cancel_event.clear()
+        _detection_busy = True
+        if not _active_task_dirs:
+            _cancel_event.clear()
         _active_thread = threading.Thread(
             target=run_task,
             args=(dict(payload),),
@@ -1750,9 +2012,9 @@ def start_task(payload: Mapping[str, Any]) -> None:
 
 
 def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
-    global _active_thread, _pending_retry_payload
+    global _active_thread, _pending_retry_payload, _detection_busy
     with _task_lock:
-        if _active_thread is not None and _active_thread.is_alive():
+        if _detection_busy or _active_task_dirs:
             queued = dict(payload)
             if _pending_retry_payload is not None:
                 existing_ids = _pending_retry_payload.get("page_ids")
@@ -1771,6 +2033,7 @@ def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
                 message="当前主流程仍在处理，失败页重试已加入队列。",
             )
             return
+        _detection_busy = True
         _cancel_event.clear()
         _active_thread = threading.Thread(
             target=run_retry_failed_pages,
@@ -1781,18 +2044,40 @@ def start_retry_failed_pages(payload: Mapping[str, Any]) -> None:
         _active_thread.start()
 
 
-def launch_pending_retry() -> None:
-    global _active_thread, _pending_retry_payload
+def release_detection_slot() -> None:
+    global _detection_busy
     with _task_lock:
-        if _pending_retry_payload is None:
+        _detection_busy = False
+
+
+def launch_pending_work() -> None:
+    global _active_thread, _pending_retry_payload, _detection_busy
+    with _task_lock:
+        if _detection_busy:
             return
-        payload = _pending_retry_payload
-        _pending_retry_payload = None
+        if _pending_retry_payload is not None and not _active_task_dirs:
+            payload = _pending_retry_payload
+            _pending_retry_payload = None
+            target = run_retry_failed_pages
+            name = "desktop-v2-page-retry"
+        elif _pending_task_payloads:
+            payload = _pending_task_payloads.popleft()
+            target = run_task
+            name = "desktop-v2-task"
+            for position, queued in enumerate(_pending_task_payloads, start=1):
+                emit(
+                    "task.queue_updated",
+                    task_id=str(queued.get("_queue_id") or ""),
+                    queue_position=position,
+                )
+        else:
+            return
+        _detection_busy = True
         _active_thread = threading.Thread(
-            target=run_retry_failed_pages,
+            target=target,
             args=(payload,),
             daemon=True,
-            name="desktop-v2-page-retry",
+            name=name,
         )
         _active_thread.start()
 
@@ -1803,7 +2088,7 @@ def handle_command(command: Mapping[str, Any]) -> None:
         emit(
             "worker.ready",
             project_root=str(project_root()),
-            algorithm_version="1.4.11",
+            algorithm_version="1.4.17",
             ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
             ffprobe_path=bundled_tool("ffprobe") or "PATH",
         )
@@ -1821,6 +2106,8 @@ def handle_command(command: Mapping[str, Any]) -> None:
             "tasks.list",
             tasks=list_tasks(str(command.get("output_root") or "") or None),
         )
+    elif action == "replay_active":
+        replay_active_events()
     elif action == "delete_task":
         task_id = str(command.get("task_id") or "")
         try:
@@ -1831,6 +2118,28 @@ def handle_command(command: Mapping[str, Any]) -> None:
             emit("task.deleted", task_id=task_id)
         except Exception as exc:
             emit("task.delete_failed", task_id=task_id, error=str(exc))
+    elif action == "delete_page":
+        task_id = str(command.get("task_id") or "")
+        page_id = int(command.get("page_id") or 0)
+        try:
+            task = delete_task_page(
+                task_id,
+                page_id,
+                str(command.get("output_root") or "") or None,
+            )
+            emit(
+                "page.deleted",
+                task_id=task_id,
+                page_id=page_id,
+                result=task,
+            )
+        except Exception as exc:
+            emit(
+                "page.delete_failed",
+                task_id=task_id,
+                page_id=page_id,
+                error=str(exc),
+            )
     elif action == "retry_failed_pages":
         payload = command.get("payload", {})
         if not isinstance(payload, Mapping):
@@ -1849,7 +2158,7 @@ def main() -> int:
     emit(
         "worker.ready",
         project_root=str(project_root()),
-        algorithm_version="1.4.11",
+        algorithm_version="1.4.17",
         ffmpeg_path=bundled_tool("ffmpeg") or "PATH",
         ffprobe_path=bundled_tool("ffprobe") or "PATH",
     )

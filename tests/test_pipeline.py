@@ -74,10 +74,6 @@ class TemporalPipelineIntegrationTests(unittest.TestCase):
                 temporal_chunk_duration_sec=30.0,
                 auto_detect_screen_crop=False,
                 min_page_duration_sec=4.0,
-                screen_crop_left_ratio=0.0,
-                screen_crop_top_ratio=0.0,
-                screen_crop_right_ratio=0.0,
-                screen_crop_bottom_ratio=0.0,
             )
             ready_pages: list[tuple[int, int, int]] = []
 
