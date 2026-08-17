@@ -6,6 +6,10 @@
 
 课析从课堂录像中识别 PPT 页面及其出现时间，按页整理讲话文字，再通过 OpenAI 兼容的多模态模型评估讲话与 PPT 的关联程度。当前桌面端版本为 **2.0.26**，分析内核版本为 **1.4.17**。
 
+## 宣传片
+
+<video src="https://github.com/user-attachments/assets/48317655-d435-483a-84b5-9debfe7256be" controls width="720"></video>
+
 ## 主要功能
 
 - 自动识别 PPT 页面、起止时间和原视频分辨率截图。
