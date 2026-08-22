@@ -53,7 +53,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="输出单行 JSON",
     )
     subparsers.add_parser("gui", help="启动桌面图形界面")
-    subparsers.add_parser("desktop-gui", help="启动统一的一键处理桌面应用")
     subparsers.add_parser("transcribe-gui", help="启动逐页语音转文字界面")
     subparsers.add_parser("llm-evaluation-gui", help="启动PPT讲话关联度评估界面")
 
@@ -218,10 +217,6 @@ def main(argv: list[str] | None = None) -> int:
             from .llm_evaluation_gui import main as llm_evaluation_gui_main
 
             return llm_evaluation_gui_main()
-        elif args.command == "desktop-gui":
-            from .desktop_app import main as desktop_gui_main
-
-            return desktop_gui_main()
         else:
             from .gui import main as gui_main
 

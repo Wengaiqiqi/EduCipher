@@ -18,7 +18,6 @@ dependencies = [
 [project.scripts]
 video-page-detector = "video_page_detector.cli:main"
 video-page-detector-gui = "video_page_detector.gui:main"
-classroom-ppt-processor = "video_page_detector.desktop_app:main"
 
 [tool.setuptools.packages.find]
 include = ["video_page_detector*"]

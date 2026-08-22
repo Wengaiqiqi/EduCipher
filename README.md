@@ -137,12 +137,6 @@ cd desktop_v2
 npm run dev
 ```
 
-也可以启动 Python 统一桌面入口：
-
-```powershell
-python -m video_page_detector desktop-gui
-```
-
 ## 构建 Windows 安装包
 
 ```powershell
