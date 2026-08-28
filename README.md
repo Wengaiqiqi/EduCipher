@@ -6,7 +6,7 @@
 
 ## 宣传片
 
-<video src="https://github.com/user-attachments/assets/48317655-d435-483a-84b5-9debfe7256be" controls width="720"></video>
+https://github.com/user-attachments/assets/52d71e7d-cb5f-41a8-b54a-dce3939ba151
 
 ## 主要功能
 
