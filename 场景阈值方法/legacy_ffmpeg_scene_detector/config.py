@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass, fields
-from pathlib import Path
-from typing import Any, Mapping
+from dataclasses import asdict, dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -39,27 +37,6 @@ class DetectorConfig:
     jpeg_quality: int = 90
     ffmpeg_path: str | None = None
     ffprobe_path: str | None = None
-
-    @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "DetectorConfig":
-        allowed = {field.name for field in fields(cls)}
-        unknown = sorted(set(data) - allowed)
-        if unknown:
-            raise ValueError(f"Unknown configuration keys: {', '.join(unknown)}")
-        config = cls(**dict(data))
-        config.validate()
-        return config
-
-    @classmethod
-    def from_file(cls, path: str | Path) -> "DetectorConfig":
-        config_path = Path(path)
-        try:
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON configuration: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ValueError("Configuration root must be a JSON object")
-        return cls.from_mapping(data)
 
     def validate(self) -> None:
         if not 0.0 <= self.scene_threshold <= 1.0:

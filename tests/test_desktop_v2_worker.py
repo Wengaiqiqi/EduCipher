@@ -6,7 +6,7 @@ import time
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from video_page_detector.desktop_v2_worker import (
     delete_task_page,
@@ -16,11 +16,13 @@ from video_page_detector.desktop_v2_worker import (
     emit,
     emit_page,
     handle_command,
+    list_models,
     llm_config,
     list_tasks,
     launch_pending_work,
     load_run_elapsed,
     load_task,
+    models_endpoint,
     page_speech_text,
     replay_active_events,
     run_task,
@@ -31,8 +33,48 @@ from video_page_detector.desktop_v2_worker import (
     transcription_config,
 )
 
+CLOUD_SETTINGS = {
+    "mimo_base_url": "https://asr.example/v1",
+    "mimo_model": "asr-model",
+    "llm_base_url": "https://llm.example/v1/chat/completions",
+    "llm_model": "llm-model",
+}
+
 
 class DesktopV2WorkerTests(unittest.TestCase):
+    def test_models_endpoint_accepts_base_or_chat_completions_url(self) -> None:
+        self.assertEqual(
+            models_endpoint("https://api.example.com/v1/"),
+            "https://api.example.com/v1/models",
+        )
+        self.assertEqual(
+            models_endpoint("https://api.example.com/v1/chat/completions"),
+            "https://api.example.com/v1/models",
+        )
+
+    def test_list_models_emits_sorted_model_ids(self) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"data": [{"id": "b"}, {"id": "a"}, {"id": "a"}]}
+        with (
+            patch("httpx.get", return_value=response) as get,
+            patch("video_page_detector.desktop_v2_worker.emit") as emit,
+        ):
+            list_models("llm", "https://api.example.com/v1", "sk-test")
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], "https://api.example.com/v1/models")
+        emit.assert_called_once_with("models.list", target="llm", models=["a", "b"])
+
+    def test_list_models_reports_failure(self) -> None:
+        with (
+            patch("httpx.get", side_effect=RuntimeError("boom")),
+            patch("video_page_detector.desktop_v2_worker.emit") as emit,
+        ):
+            list_models("asr", "https://api.example.com/v1", "sk-test")
+        emit.assert_called_once()
+        self.assertEqual(emit.call_args.args[0], "models.failed")
+        self.assertIn("boom", emit.call_args.kwargs["error"])
+
     def test_pending_tasks_launch_in_fifo_order(self) -> None:
         pending: deque[dict] = deque([
             {"_queue_id": "queue-1", "video_id": "one"},
@@ -175,11 +217,28 @@ class DesktopV2WorkerTests(unittest.TestCase):
         self.assertEqual(emit.call_args.kwargs["algorithm_version"], "1.4.17")
 
     def test_detailed_evidence_setting_reaches_llm_config(self) -> None:
-        self.assertTrue(llm_config({"include_evidence": True}).include_evidence)
-        self.assertFalse(llm_config({"include_evidence": False}).include_evidence)
+        llm = {"llm_base_url": "https://llm.example/v1", "llm_model": "m"}
+        self.assertTrue(llm_config({**llm, "include_evidence": True}).include_evidence)
+        self.assertFalse(llm_config({**llm, "include_evidence": False}).include_evidence)
+
+    def test_cloud_settings_require_url_and_model_without_presets(self) -> None:
+        with self.assertRaisesRegex(ValueError, "LLM 兼容地址和模型名称"):
+            llm_config({})
+        with self.assertRaisesRegex(ValueError, "ASR 兼容地址和模型名称"):
+            transcription_config({"asr_engine": "mimo-cloud"})
+        config = transcription_config(
+            {
+                "asr_engine": "mimo-cloud",
+                "mimo_base_url": "https://asr.example/v1",
+                "mimo_model": "asr-model",
+            }
+        )
+        self.assertEqual(config.mimo_base_url, "https://asr.example/v1")
+        self.assertEqual(config.mimo_model, "asr-model")
 
     def test_desktop_cloud_concurrency_settings_are_capped_at_ten(self) -> None:
-        self.assertEqual(llm_config({"llm_concurrency": 10}).max_concurrency, 10)
+        llm = {"llm_base_url": "https://llm.example/v1", "llm_model": "m"}
+        self.assertEqual(llm_config({**llm, "llm_concurrency": 10}).max_concurrency, 10)
         self.assertEqual(
             transcription_config({"asr_concurrency": 10}).mimo_max_concurrency,
             10,
@@ -337,6 +396,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
                         "output_root": temp,
                         "page_ids": [1, 2, 3, 4, 5, 6],
                         "settings": {
+                            **CLOUD_SETTINGS,
                             "llm_concurrency": 5,
                             "include_evidence": False,
                         },
@@ -437,6 +497,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
                         "output_root": temp,
                         "page_ids": [1, 2, 3, 4],
                         "settings": {
+                            **CLOUD_SETTINGS,
                             "asr_engine": "mimo-cloud",
                             "asr_concurrency": 3,
                             "include_llm": False,
@@ -588,6 +649,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
                             "output_root": temp,
                             "page_ids": [1, 2],
                             "settings": {
+                                **CLOUD_SETTINGS,
                                 "asr_engine": "mimo-cloud",
                                 "asr_concurrency": 5,
                                 "llm_concurrency": 5,
@@ -972,7 +1034,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
                         "task_id": str(run_dir),
                         "output_root": temp,
                         "page_ids": [1],
-                        "settings": {"asr_engine": "mimo-cloud"},
+                        "settings": {**CLOUD_SETTINGS, "asr_engine": "mimo-cloud"},
                         "asr_api_key": "test-key",
                         "asr_upload_consent": True,
                         "llm_upload_consent": False,
@@ -1166,6 +1228,7 @@ class DesktopV2WorkerTests(unittest.TestCase):
                         "output_root": temp,
                         "page_ids": [1],
                         "settings": {
+                            **CLOUD_SETTINGS,
                             "asr_engine": "mimo-cloud",
                             "include_evidence": False,
                         },
