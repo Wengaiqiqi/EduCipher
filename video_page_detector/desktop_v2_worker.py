@@ -1475,14 +1475,16 @@ def transcription_config(settings: Mapping[str, Any]) -> TranscriptionConfig:
                 f"所选文件夹中没有 model.bin，请选择完整的 faster-whisper 模型目录：{model_dir}"
             )
         model = str(model_dir.resolve())
+    mimo_base_url = str(settings.get("mimo_base_url") or "").strip()
+    mimo_model = str(settings.get("mimo_model") or "").strip()
+    if engine == "mimo-cloud" and not (mimo_base_url and mimo_model):
+        raise ValueError("请先在设置中填写 ASR 兼容地址和模型名称。")
     config = replace(
         base,
         engine=engine,
         model=model,
-        mimo_base_url=str(
-            settings.get("mimo_base_url") or base.mimo_base_url
-        ),
-        mimo_model=str(settings.get("mimo_model") or base.mimo_model),
+        mimo_base_url=mimo_base_url or base.mimo_base_url,
+        mimo_model=mimo_model or base.mimo_model,
         mimo_max_concurrency=min(
             10,
             int(settings.get("asr_concurrency") or base.mimo_max_concurrency),
@@ -1502,10 +1504,14 @@ def llm_config(settings: Mapping[str, Any]) -> LLMEvaluationConfig:
         else LLMEvaluationConfig()
     )
     ev = bool(settings.get("include_evidence", False))
+    base_url = str(settings.get("llm_base_url") or "").strip()
+    model = str(settings.get("llm_model") or "").strip()
+    if not (base_url and model):
+        raise ValueError("请先在设置中填写 LLM 兼容地址和模型名称。")
     config = replace(
         base,
-        base_url=str(settings.get("llm_base_url") or base.base_url),
-        model=str(settings.get("llm_model") or base.model),
+        base_url=base_url,
+        model=model,
         max_concurrency=min(
             10,
             int(settings.get("llm_concurrency") or base.max_concurrency),
@@ -1610,7 +1616,7 @@ def run_task(payload: Mapping[str, Any]) -> None:
 
         if transcribe_config and transcribe_config.engine == "mimo-cloud":
             if not bool(payload.get("asr_upload_consent")):
-                raise ValueError("请确认允许把临时音频发送给小米 MiMo。")
+                raise ValueError("请确认允许把临时音频发送给 ASR 模型服务。")
             asr_key = resolve_mimo_api_key(
                 transcribe_config.mimo_api_key_env,
                 str(payload.get("asr_api_key") or ""),
@@ -2082,6 +2088,35 @@ def launch_pending_work() -> None:
         _active_thread.start()
 
 
+def models_endpoint(base_url: str) -> str:
+    url = base_url.strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        url = url[: -len("/chat/completions")]
+    return f"{url}/models"
+
+
+def list_models(target: str, base_url: str, api_key: str) -> None:
+    try:
+        import httpx
+
+        response = httpx.get(
+            models_endpoint(base_url),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20,
+        )
+        if response.status_code >= 400:
+            raise ValueError(f"HTTP {response.status_code}，请检查兼容地址和 API Key")
+        data = response.json().get("data") or []
+        models = sorted(
+            {str(item["id"]) for item in data if isinstance(item, Mapping) and item.get("id")}
+        )
+        if not models:
+            raise ValueError("接口没有返回任何模型")
+        emit("models.list", target=target, models=models)
+    except Exception as exc:
+        emit("models.failed", target=target, error=f"获取模型失败：{exc}")
+
+
 def handle_command(command: Mapping[str, Any]) -> None:
     action = str(command.get("action") or "")
     if action == "ping":
@@ -2146,6 +2181,16 @@ def handle_command(command: Mapping[str, Any]) -> None:
             emit("task.retry_failed", error="重试参数格式不正确。")
             return
         start_retry_failed_pages(payload)
+    elif action == "list_models":
+        threading.Thread(
+            target=list_models,
+            args=(
+                str(command.get("target") or ""),
+                str(command.get("base_url") or ""),
+                str(command.get("api_key") or ""),
+            ),
+            daemon=True,
+        ).start()
     else:
         emit("worker.log", message=f"未知桌面端命令：{action}")
 

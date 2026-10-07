@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -54,15 +54,40 @@ const DEFAULT_SETTINGS: AppSettings = {
   asr_model: "",
   asr_api_key: "",
   llm_api_key: "",
-  mimo_base_url: "https://api.xiaomimimo.com/v1",
-  mimo_model: "mimo-v2.5-asr",
+  mimo_base_url: "",
+  mimo_model: "",
   asr_concurrency: 3,
-  llm_base_url: "https://api.xiaomimimo.com/v1/chat/completions",
-  llm_model: "mimo-v2.5",
+  llm_base_url: "",
+  llm_model: "",
   llm_concurrency: 5,
   include_llm: true,
   include_evidence: false,
 };
+
+// 旧版本曾把这些值作为默认预设写入本地设置，恢复时清空；用户自己填写的值保留。
+const LEGACY_PRESETS: Partial<Record<keyof AppSettings, string>> = {
+  mimo_base_url: "https://api.xiaomimimo.com/v1",
+  mimo_model: "mimo-v2.5-asr",
+  llm_base_url: "https://api.xiaomimimo.com/v1/chat/completions",
+  llm_model: "mimo-v2.5",
+};
+
+function missingCloudSettings(value: AppSettings, mode: "full" | "detect"): string {
+  if (mode !== "full") return "";
+  if (
+    value.asr_engine === "mimo-cloud"
+    && !(value.mimo_base_url.trim() && value.mimo_model.trim() && value.asr_api_key.trim())
+  ) {
+    return "请先在设置中填写 ASR 兼容地址、模型名称和 API Key。";
+  }
+  if (
+    value.include_llm
+    && !(value.llm_base_url.trim() && value.llm_model.trim() && value.llm_api_key.trim())
+  ) {
+    return "请先在设置中填写 LLM 兼容地址、模型名称和 API Key。";
+  }
+  return "";
+}
 
 const MAX_SHARED_CLOUD_REQUESTS = 10;
 
@@ -573,6 +598,132 @@ function Inspector({
   );
 }
 
+type ModelTarget = "asr" | "llm";
+
+function ModelNameField({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState<string | null>(null);
+  const [active, setActive] = useState(-1);
+  const [dropUp, setDropUp] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const shown = query === null
+    ? options
+    : options.filter((model) => model.toLowerCase().includes(query.trim().toLowerCase()));
+
+  function place() {
+    const box = boxRef.current?.getBoundingClientRect();
+    const modal = boxRef.current?.closest(".modal");
+    const limit = modal?.querySelector(".modal-actions")?.getBoundingClientRect().top
+      ?? window.innerHeight;
+    setDropUp(Boolean(box && limit - box.bottom < 250 && box.top > limit - box.bottom));
+  }
+  function show() {
+    place();
+    setQuery(null);
+    setActive(options.indexOf(value));
+    setOpen(true);
+  }
+  function choose(model: string) {
+    onChange(model);
+    setOpen(false);
+  }
+
+  useEffect(() => {
+    if (options.length) show();
+  }, [options]);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!boxRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+
+  useEffect(() => {
+    menuRef.current?.children[active]?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!options.length) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) return show();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      setActive((current) => Math.min(Math.max(current + step, 0), shown.length - 1));
+    } else if (event.key === "Enter" && open && shown[active]) {
+      event.preventDefault();
+      choose(shown[active]);
+    } else if (event.key === "Escape" && open) {
+      event.stopPropagation();
+      setOpen(false);
+    }
+  }
+
+  return (
+    <label>
+      模型名称
+      <div className="model-combo" ref={boxRef} onKeyDown={onKeyDown}>
+        <input
+          value={value}
+          placeholder="填写或点击获取模型"
+          onChange={(e) => {
+            onChange(e.target.value);
+            setQuery(e.target.value);
+            setActive(0);
+            if (options.length && !open) {
+              place();
+              setOpen(true);
+            }
+          }}
+        />
+        {options.length > 0 && (
+          <button type="button" className="model-combo-toggle" onClick={() => (open ? setOpen(false) : show())}>
+            <ChevronDown size={16} />
+          </button>
+        )}
+        {open && shown.length > 0 && (
+          <div className={`model-menu ${dropUp ? "up" : ""}`} ref={menuRef} role="listbox">
+            {shown.map((model, index) => (
+              <button
+                type="button"
+                key={model}
+                role="option"
+                aria-selected={model === value}
+                className={`${model === value ? "selected" : ""} ${index === active ? "active" : ""}`}
+                onMouseEnter={() => setActive(index)}
+                onClick={() => choose(model)}
+              >
+                {model}
+                {model === value && <Check size={15} />}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </label>
+  );
+}
+
+function FetchModelsButton({ loading, onClick }: { loading: boolean; onClick: () => void }) {
+  return (
+    <button type="button" className="button secondary fetch-models" disabled={loading} onClick={onClick}>
+      {loading ? <LoaderCircle size={16} className="spin" /> : <RotateCcw size={16} />}
+      {loading ? "获取中…" : "获取模型"}
+    </button>
+  );
+}
+
 function SettingsModal({
   settings,
   onSave,
@@ -584,8 +735,45 @@ function SettingsModal({
 }) {
   const [draft, setDraft] = useState(settings);
   const [settingsError, setSettingsError] = useState("");
+  const [modelOptions, setModelOptions] = useState<Record<ModelTarget, string[]>>({ asr: [], llm: [] });
+  const [fetchingModels, setFetchingModels] = useState<ModelTarget | "">("");
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
     setDraft((current) => normalizeCloudConcurrency({ ...current, [key]: value }));
+  useEffect(() => {
+    const unlisten = listen<WorkerEvent>("worker-event", (event) => {
+      const data = event.payload;
+      if (data.type === "models.list" && data.target) {
+        const target = data.target;
+        setModelOptions((current) => ({ ...current, [target]: data.models || [] }));
+        setFetchingModels("");
+        setSettingsError("");
+      } else if (data.type === "models.failed") {
+        setFetchingModels("");
+        setSettingsError(data.error || "获取模型失败。");
+      }
+    });
+    return () => {
+      unlisten.then((dispose) => dispose());
+    };
+  }, []);
+  async function fetchModels(target: ModelTarget) {
+    const baseUrl = target === "asr" ? draft.mimo_base_url : draft.llm_base_url;
+    const apiKey = target === "asr" ? draft.asr_api_key : draft.llm_api_key;
+    if (!baseUrl.trim() || !apiKey.trim()) {
+      setSettingsError("请先填写兼容地址和 API Key，再获取模型。");
+      return;
+    }
+    setFetchingModels(target);
+    setSettingsError("");
+    try {
+      await invoke("send_worker_command", {
+        command: { action: "list_models", target, base_url: baseUrl, api_key: apiKey },
+      });
+    } catch (error) {
+      setFetchingModels("");
+      setSettingsError(String(error));
+    }
+  }
   async function chooseLocalModelDirectory() {
     const value = await open({
       directory: true,
@@ -651,35 +839,35 @@ function SettingsModal({
               </label>
             ) : (
               <>
-                <div className="form-two-columns aligned-fields">
-                  <label className="wide-field">ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} /></label>
-                  <label>模型名称<input value={draft.mimo_model} onChange={(e) => update("mimo_model", e.target.value)} /></label>
-                  <label>
-                    并发上限
-                    <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
-                    {Array.from({ length: asrConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
-                    </select>
-                  </label>
-                </div>
+                <label>ASR 兼容地址<input value={draft.mimo_base_url} onChange={(e) => update("mimo_base_url", e.target.value)} placeholder="https://…/v1" /></label>
                 <label>ASR API Key<input type="password" value={draft.asr_api_key} onChange={(e) => update("asr_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
+                <div className="form-two-columns aligned-fields">
+                  <ModelNameField value={draft.mimo_model} options={modelOptions.asr} onChange={(value) => update("mimo_model", value)} />
+                  <FetchModelsButton loading={fetchingModels === "asr"} onClick={() => fetchModels("asr")} />
+                </div>
+                <label>
+                  并发上限
+                  <select value={draft.asr_concurrency} onChange={(e) => update("asr_concurrency", Number(e.target.value))}>
+                  {Array.from({ length: asrConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </label>
               </>
             )}
           </section>
           <section className="wide">
             <h3><WandSparkles size={17} /> LLM 关联度评分</h3>
+            <label>OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} placeholder="https://…/v1/chat/completions" /></label>
+            <label>LLM API Key<input type="password" value={draft.llm_api_key} onChange={(e) => update("llm_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
             <div className="form-two-columns aligned-fields">
-              <label>
-                模型名称
-                <input value={draft.llm_model} onChange={(e) => update("llm_model", e.target.value)} />
-              </label>
-              <label>
-                并发上限
-                <select value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))}>
-                  {Array.from({ length: llmConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
-                </select>
-              </label>
-              <label className="wide-field">OpenAI 兼容地址<input value={draft.llm_base_url} onChange={(e) => update("llm_base_url", e.target.value)} /></label>
+              <ModelNameField value={draft.llm_model} options={modelOptions.llm} onChange={(value) => update("llm_model", value)} />
+              <FetchModelsButton loading={fetchingModels === "llm"} onClick={() => fetchModels("llm")} />
             </div>
+            <label>
+              并发上限
+              <select value={draft.llm_concurrency} onChange={(e) => update("llm_concurrency", Number(e.target.value))}>
+                {Array.from({ length: llmConcurrencyMax }, (_, index) => index + 1).map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
             <label>
               返回详细对应证据
               <select value={draft.include_evidence ? "true" : "false"} onChange={(e) => update("include_evidence", e.target.value === "true")}>
@@ -687,7 +875,6 @@ function SettingsModal({
                 <option value="true">开启</option>
               </select>
             </label>
-            <label>LLM API Key<input type="password" value={draft.llm_api_key} onChange={(e) => update("llm_api_key", e.target.value)} placeholder="sk-••••••••" /></label>
           </section>
           {settingsError && <div className="form-error settings-error"><XCircle size={16} />{settingsError}</div>}
         </div>
@@ -736,6 +923,11 @@ function NewTaskModal({
   async function submit() {
     if (!videoPaths.length || !outputRoot || (videoPaths.length === 1 && !videoId.trim())) {
       setError("请选择视频、结果目录并填写任务名称。");
+      return;
+    }
+    const missing = missingCloudSettings(settings, mode);
+    if (missing) {
+      setError(missing);
       return;
     }
     const names = new Map<string, number>();
@@ -886,7 +1078,6 @@ export default function App() {
   const [cloudActive, setCloudActive] = useState(0);
   const [error, setError] = useState("");
   const [workerStatus, setWorkerStatus] = useState<"starting" | "ready" | "failed">("starting");
-  const [algorithmVersion, setAlgorithmVersion] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">(
     () => (localStorage.getItem("kexi.theme") as "dark" | "light") || "light",
   );
@@ -927,6 +1118,9 @@ export default function App() {
     if (/^(tiny|base|small|medium|large(?:-v[123])?)$/i.test(restored.asr_model || "")) {
       restored.asr_model = "";
     }
+    for (const [key, preset] of Object.entries(LEGACY_PRESETS) as [keyof AppSettings, string][]) {
+      if (restored[key] === preset) (restored as Record<string, unknown>)[key] = "";
+    }
     if (saved) {
       localStorage.setItem(
         "kexi.settings",
@@ -943,7 +1137,6 @@ export default function App() {
       const data = event.payload;
       if (data.type === "worker.ready") {
         setWorkerStatus("ready");
-        setAlgorithmVersion(data.algorithm_version || "");
         return;
       }
       if (data.type === "worker.error" || data.type === "worker.exited") {
@@ -1347,12 +1540,12 @@ export default function App() {
           <ChevronDown size={15} />
         </div>
         <div className="titlebar-spacer" data-tauri-drag-region />
-        <div className={`cloud-health ${workerStatus === "failed" ? "has-error" : ""}`}>
+        <div className={`cloud-health ${workerStatus === "failed" ? "has-error" : ""}`} title={workerStatus === "ready" ? "处理引擎正常" : undefined}>
           <Cloud size={16} />
-          {workerStatus === "ready"
-            ? `处理引擎正常${algorithmVersion ? ` · 内核 ${algorithmVersion}` : ""}`
-            : workerStatus === "failed"
-              ? "处理引擎异常"
+          {workerStatus === "failed"
+            ? "处理引擎异常"
+            : workerStatus === "ready"
+              ? null
               : "正在连接处理引擎"}
         </div>
         <div className="window-actions">
@@ -1458,11 +1651,9 @@ export default function App() {
 
             {!activeTask ? (
               <div className="welcome-empty">
-                <div className="welcome-icon"><Video size={34} /></div>
-                <span>从一个课堂视频开始</span>
                 <h2>识别 PPT、转换讲话并完成关联度评分</h2>
                 <p>课析会以实时流水线显示每一页的处理状态和最终结果。</p>
-                <button className="button primary" onClick={() => setShowNewTask(true)}><Plus size={17} />新建分析任务</button>
+                <button className="button welcome-action" onClick={() => setShowNewTask(true)}><Plus size={17} />新建分析任务</button>
                 {error && <div className="task-error"><XCircle size={17} /><span>{error}</span><button onClick={() => setError("")}>关闭</button></div>}
               </div>
             ) : (
@@ -1521,7 +1712,7 @@ export default function App() {
         <div><CheckCircle2 size={16} /><span>已完成</span><strong>{completedPages} 页</strong></div>
         <div className={failedPages ? "has-error" : ""}><XCircle size={16} /><strong>{failedPages}</strong><span>个错误</span></div>
         <div className="status-spacer" />
-        <div><span>模型</span><strong className="model-name">{settings.llm_model || "MiMo"}</strong></div>
+        <div><span>模型</span><strong className="model-name">{settings.llm_model || "未设置"}</strong></div>
         <div><Activity size={16} className="pulse" /><span>{hasRunningTask ? "服务活动中" : "服务待命"}</span></div>
       </footer>
 

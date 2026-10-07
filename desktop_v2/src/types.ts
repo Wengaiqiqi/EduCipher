@@ -115,6 +115,8 @@ export interface WorkerEvent {
   active_cloud_requests?: number;
   cloud_limit?: number;
   algorithm_version?: string;
+  target?: "asr" | "llm";
+  models?: string[];
   detector_algorithm?: AppSettings["detector_algorithm"];
   asr_concurrency?: number;
   llm_concurrency?: number;
