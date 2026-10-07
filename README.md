@@ -148,24 +148,6 @@ npm run dist:win
 desktop_v2/src-tauri/target/release/bundle/nsis/
 ```
 
-## 命令行
-
-查看所有命令：
-
-```powershell
-python -m video_page_detector --help
-```
-
-只识别 PPT 页面：
-
-```powershell
-python -m video_page_detector detect "E:\课堂视频\lesson.mp4" `
-  --config "config\default.json" `
-  --output "E:\课析结果"
-```
-
-其他入口包括 `transcribe`、`evaluate-llm`、`gui`、`transcribe-gui` 和 `llm-evaluation-gui`。日常使用推荐直接使用 Tauri 桌面端。
-
 ## 测试
 
 主程序：
@@ -177,7 +159,7 @@ python -m unittest discover -s tests -v
 归档场景阈值算法：
 
 ```powershell
-python -m unittest discover -s "场景阈值方法/legacy_ffmpeg_scene_detector/tests" -v
+python -m unittest discover -s "场景阈值方法/legacy_ffmpeg_scene_detector/tests" -t "场景阈值方法" -v
 ```
 
 前端类型检查与构建：

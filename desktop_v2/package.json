@@ -7,7 +7,6 @@
     "dev": "tauri dev",
     "web:dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "desktop": "tauri dev",
     "build:worker": "cd .. && python -m PyInstaller --noconfirm build_desktop_v2_worker.spec",
     "dist:win": "npm run build:worker && tauri build"
   },
