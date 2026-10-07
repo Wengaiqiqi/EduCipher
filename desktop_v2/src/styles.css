@@ -1809,6 +1809,11 @@ select:focus-visible {
   color: #7eaaff;
 }
 
+.report-row:last-child {
+  border-bottom: 0;
+  border-radius: 0 0 10px 10px;
+}
+
 .report-row > div:nth-child(2) {
   display: flex;
   flex-direction: column;
@@ -1925,8 +1930,8 @@ select:focus-visible {
   background: var(--bg);
   color-scheme: light;
 }
-.light .workspace,
 .light .reports-view { background: var(--bg); }
+.light .workspace { background: var(--panel); }
 .light .titlebar,
 .light .sidebar,
 .light .statusbar,
@@ -2026,39 +2031,75 @@ select:focus-visible {
   color: var(--text);
   background: transparent;
 }
-.light .sidebar nav button:hover,
-.light .sidebar nav button.active {
-  background: #f1f5f9;
+.light .sidebar nav button:hover {
+  background: #f8fafc;
   color: var(--blue);
 }
 .light .sidebar nav button.active {
-  box-shadow: inset 2px 0 var(--blue);
+  background: var(--panel);
+  color: var(--blue);
+  box-shadow:
+    inset 2px 0 var(--blue),
+    inset 0 0 0 1px var(--border),
+    0 2px 6px rgba(17, 24, 39, 0.05);
 }
 .light .new-task-button {
-  background: linear-gradient(180deg, rgba(37, 99, 235, 0.06), rgba(37, 99, 235, 0.02));
-  color: var(--blue);
-  border-color: rgba(37, 99, 235, 0.25);
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+  box-shadow: 0 2px 6px rgba(17, 24, 39, 0.05);
 }
 .light .new-task-button:hover {
-  background: rgba(37, 99, 235, 0.12);
+  background: #f5f6f8;
+  border-color: #c4cad3;
+}
+.light .path-picker {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+.light .path-picker:hover {
+  background: #e8ebf0;
 }
 .light .project-switcher,
 .light .collapse-button,
-.light .recent-task-main,
-.light .path-picker,
-.light .button.secondary,
-.light .icon-button {
-  background: var(--panel-2);
+.light .recent-task-main {
+  background: var(--panel);
   color: var(--text);
   border-color: var(--border);
 }
 .light .project-switcher:hover,
 .light .collapse-button:hover,
-.light .recent-task-main:hover,
-.light .path-picker:hover,
+.light .recent-task-main:hover {
+  background: #f8fafc;
+}
+.light .recent-task-main.active {
+  background: var(--panel);
+  box-shadow:
+    inset 3px 0 var(--blue),
+    inset 0 0 0 1px var(--border),
+    0 2px 8px rgba(17, 24, 39, 0.06);
+}
+.light .page-card {
+  border-color: var(--border);
+  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.05);
+}
+.light .status-chip.completed {
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.3);
+  background: var(--panel);
+}
+.light .button.secondary,
+.light .icon-button {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+  box-shadow: 0 2px 6px rgba(17, 24, 39, 0.05);
+}
 .light .button.secondary:hover,
 .light .icon-button:hover {
-  background: #e8ebf0;
+  background: #f5f6f8;
+  border-color: #c4cad3;
 }
 
 .light .recent-delete {
@@ -2074,15 +2115,17 @@ select:focus-visible {
 
 .light .stream-toolbar > button.retry-button,
 .light .button.retry-button {
-  border-color: rgba(37, 99, 235, 0.28);
-  background: rgba(37, 99, 235, 0.07);
-  color: #2563eb;
+  border-color: var(--border);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 2px 6px rgba(17, 24, 39, 0.05);
 }
 
 .light .stream-toolbar > button.retry-button:hover,
 .light .button.retry-button:hover {
-  background: rgba(37, 99, 235, 0.13);
-  color: #1d4ed8;
+  background: #f5f6f8;
+  border-color: #c4cad3;
+  color: var(--text);
 }
 .light .settings-modal,
 .light .settings-modal section,
@@ -2190,6 +2233,18 @@ select:focus-visible {
 .light .score-overview > strong,
 .light .time-range strong { color: var(--text); }
 .light .button.primary { background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #fff; }
+.light .button.primary.button-white {
+  border-color: var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 2px 6px rgba(17, 24, 39, 0.05);
+}
+.light .button.primary.button-white:hover {
+  background: #f5f6f8;
+  border-color: #c4cad3;
+  filter: none;
+}
 .light .modal,
 .light .settings-grid section,
 .light .new-task-modal .task-form,
@@ -2353,6 +2408,10 @@ select:focus-visible {
 }
 .light .report-viewer-text h4,
 .light .report-viewer-page-head b,
+.light .report-viewer-summary article {
+  background: var(--panel);
+  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.05);
+}
 .light .report-viewer-summary article strong {
   color: var(--text);
 }

@@ -880,7 +880,7 @@ function SettingsModal({
         </div>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>取消</button>
-          <button className="button primary" onClick={save}>保存设置</button>
+          <button className="button primary button-white" onClick={save}>保存设置</button>
         </div>
       </div>
     </div>
@@ -996,7 +996,7 @@ function NewTaskModal({
         </div>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>取消</button>
-          <button className="button primary" onClick={submit}><Play size={16} />加入处理队列</button>
+          <button className="button primary button-white" onClick={submit}><Play size={16} />加入处理队列</button>
         </div>
       </div>
     </div>
