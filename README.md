@@ -6,7 +6,7 @@
 
 ## 宣传片
 
-https://github.com/user-attachments/assets/52d71e7d-cb5f-41a8-b54a-dce3939ba151
+https://github.com/user-attachments/assets/80a4c039-4f63-4998-8293-395ffd1950e2
 
 ## 主要功能
 
